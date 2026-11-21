@@ -1148,7 +1148,18 @@ class AvitoHunterApp(ctk.CTk):
         self.stop_words_box.insert("1.0", DEFAULT_STOP_WORDS)
 
     def _collect_config(self) -> Optional[SearchConfig]:
-        city = self.city_entry.get().strip()
+        city = self.city_entry.get().strip().lower()
+        if "avito.ru/" in city:
+            city = city.split("avito.ru/", 1)[1].split("/")[0].split("?")[0]
+            self.city_entry.delete(0, "end")
+            self.city_entry.insert(0, city)
+        if any("а" <= ch <= "я" or ch == "ё" for ch in city):
+            messagebox.showwarning(
+                "Неверный формат города",
+                "В поле города нужно указать латинский slug из ссылки Авито (например: pervouralsk или ekaterinburg), а не название русскими буквами.",
+            )
+            return None
+
         nearby_raw = self.nearby_entry.get().strip()
         nearby = [c.strip() for c in nearby_raw.split(",") if c.strip()] if nearby_raw else []
 
@@ -1156,7 +1167,10 @@ class AvitoHunterApp(ctk.CTk):
 
         pages_raw = self.pages_entry.get().strip()
         try:
-            max_pages = max(1, int(pages_raw)) if pages_raw else 3
+            raw_p = int(pages_raw) if pages_raw else 3
+            if raw_p > 30:
+                messagebox.showinfo("Лимит страниц", "Для защиты от блокировки Авито глубина поиска ограничена 30 страницами (1500 объявлений на категорию).")
+            max_pages = min(30, max(1, raw_p))
         except ValueError:
             max_pages = 3
 
