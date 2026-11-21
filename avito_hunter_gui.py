@@ -803,7 +803,7 @@ class AvitoHunterApp(ctk.CTk):
         sec_stop = self._make_section(left, "🛑 Стоп-слова")
         ctk.CTkLabel(
             sec_stop,
-            text="Разделяйте через запятую (,), точку с запятой (;), | или с новой строки",
+            text="Разделители: ,  ;  |  или Enter",
             font=self.font_small, text_color=COLOR_TEXT_DIM, anchor="w",
         ).pack(fill="x", padx=8, pady=(0, 4))
 
