@@ -448,6 +448,7 @@ class AvitoParser:
 
     async def _parse_category(self, page: Page, cat: dict[str, Any]) -> None:
         total_new = 0
+        seen_ids: set[str] = set()
         for page_num in range(1, max(1, self.config.max_pages) + 1):
             if self.stop_event.is_set():
                 return
@@ -478,10 +479,21 @@ class AvitoParser:
                     pass
                 await asyncio.sleep(0.7)
 
+            if page_num > 1 and f"p={page_num}" not in page.url:
+                self.q.put(("log", f"  · Стр. {page_num}: Авито вернул начальную страницу, конец выдачи."))
+                break
+
             cards = await page.query_selector_all('[data-marker="item"]')
             if not cards:
                 self.q.put(("log", f"  · Стр. {page_num}: карточек 0, завершаем категорию."))
                 break
+
+            page_ids = [await c.get_attribute("data-item-id") for c in cards]
+            new_ids = {i for i in page_ids if i and i not in seen_ids}
+            if not new_ids:
+                self.q.put(("log", f"  · Стр. {page_num}: новых объявлений нет (повтор выдачи), завершаем."))
+                break
+            seen_ids.update(new_ids)
 
             self.q.put(("log", f"  · Стр. {page_num}: найдено карточек {len(cards)}"))
 
