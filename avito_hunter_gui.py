@@ -479,9 +479,6 @@ class AvitoParser:
                     pass
                 await asyncio.sleep(0.7)
 
-            if cat["slug"] not in page.url:
-                self.q.put(("log", f"  · Стр. {page_num}: Авито сбросил категорию (нет точных совпадений), завершаем."))
-                break
             if page_num > 1 and f"p={page_num}" not in page.url:
                 self.q.put(("log", f"  · Стр. {page_num}: Авито вернул начальную страницу, конец выдачи."))
                 break
