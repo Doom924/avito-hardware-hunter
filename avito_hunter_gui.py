@@ -461,7 +461,7 @@ class AvitoParser:
                 break
 
             try:
-                await page.wait_for_selector('[data-marker="catalog-serp"] [data-marker="item"]', timeout=20_000)
+                await page.wait_for_selector('[data-marker="item"]', timeout=20_000)
             except Exception:
                 self.q.put((
                     "log",
@@ -486,7 +486,7 @@ class AvitoParser:
                 self.q.put(("log", f"  · Стр. {page_num}: Авито вернул начальную страницу, конец выдачи."))
                 break
 
-            cards = await page.query_selector_all('[data-marker="catalog-serp"] [data-marker="item"]')
+            cards = await page.query_selector_all('[data-marker="item"]')
             if not cards:
                 self.q.put(("log", f"  · Стр. {page_num}: карточек 0, завершаем категорию."))
                 break
