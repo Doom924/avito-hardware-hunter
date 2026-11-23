@@ -65,7 +65,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-APP_TITLE = "Avito PC-Parts Hunter & Scorer v2.0.0"
+APP_TITLE = "Avito Hardware Hunter v2.2.0"
 SETTINGS_FILE = os.path.join(_app_dir(), "settings.json")
 DB_FILE = os.path.join(_app_dir(), "hunter_history.db")
 BROWSER_PROFILE_DIR = os.path.join(_app_dir(), "browser_profile")
@@ -329,7 +329,14 @@ class SmoothScrollFrame(ctk.CTkFrame):
 # ---------------------------------------------------------------------------
 # Парсер Авито (Playwright)
 # ---------------------------------------------------------------------------
-def build_search_url(city: str, category_path: str, query: str, page: int) -> str:
+def build_search_url(
+    city: str,
+    category_path: str,
+    query: str,
+    page: int,
+    min_price: int = 0,
+    max_price: int = 0,
+) -> str:
     city = (city or "rossiya").strip() or "rossiya"
     q = urllib.parse.quote(query) if query else ""
     url = f"{BASE_URL}/{city}{category_path}"
@@ -338,6 +345,10 @@ def build_search_url(city: str, category_path: str, query: str, page: int) -> st
         params.append(f"q={q}")
     if page > 1:
         params.append(f"p={page}")
+    if min_price > 0:
+        params.append(f"pmin={min_price}")
+    if max_price > 0:
+        params.append(f"pmax={max_price}")
     if params:
         url += "?" + "&".join(params)
     return url
@@ -370,6 +381,7 @@ def scrape_page(
     page: int,
     q_words: list[str],
     stop_words: list[str],
+    min_price: int,
     max_price: int,
 ) -> list[dict[str, Any]]:
     """Возвращает список карточек с одной страницы, используя единую вкладку."""
@@ -415,7 +427,9 @@ def scrape_page(
                 continue
             if stop_words and contains_stop_words(title, stop_words):
                 continue
-            if max_price and price > max_price:
+            if min_price > 0 and price < min_price:
+                continue
+            if max_price > 0 and price > max_price:
                 continue
 
             card_text = ""
@@ -423,6 +437,14 @@ def scrape_page(
                 card_text = card.inner_text()
             except Exception:
                 pass
+            # --- зарезервированные лоты ---
+            reserved_marker = card.query_selector('[data-marker*="reserved"], [class*="reserved"]')
+            if reserved_marker is not None or any(
+                word in card_text.lower()
+                for word in ("зарезервирован", "забронирован")
+            ):
+                continue
+
             has_delivery = bool(card.query_selector('[data-marker="delivery/icon"], [class*="delivery"]')) or ("доставка" in card_text.lower())
 
             description = ""
@@ -435,6 +457,13 @@ def scrape_page(
             except Exception:
                 pass
 
+            location_el = card.query_selector('[data-marker="item-address"]')
+            location = (
+                location_el.inner_text().strip().split(",")[0].strip()
+                if location_el
+                else city
+            )
+
             results.append({
                 "item_id": item_id,
                 "title": title,
@@ -442,6 +471,7 @@ def scrape_page(
                 "url": full_url,
                 "seller": seller,
                 "category": category_name,
+                "location": location,
                 "description": description,
                 "has_delivery": has_delivery,
             })
@@ -481,6 +511,9 @@ class AvitoHunterApp(ctk.CTk):
         # --- UI ---
         self._build_ui()
         self._restore_settings_to_ui()
+
+        # --- универсальные горячие клавиши копирования (EN/RU, Linux/Windows) ---
+        self._bind_universal_clipboard()
 
     # ---------------- UI ----------------
     def _build_ui(self) -> None:
@@ -550,8 +583,8 @@ class AvitoHunterApp(ctk.CTk):
         self.spin_pages = ctk.CTkEntry(base)
         self.spin_pages.pack(fill="x", padx=8, pady=2)
 
-        ctk.CTkLabel(base, text="Стоп-слова (через запятую):").pack(anchor="w", padx=8, pady=(8, 0))
-        self.entry_stop = ctk.CTkEntry(base)
+        ctk.CTkLabel(base, text="Стоп-слова (через запятую/перенос строки):").pack(anchor="w", padx=8, pady=(8, 0))
+        self.entry_stop = ctk.CTkTextbox(base, height=76, wrap="word")
         self.entry_stop.pack(fill="x", padx=8, pady=(2, 8))
 
         # --- чекбокс скрытия просмотренных ---
@@ -570,6 +603,7 @@ class AvitoHunterApp(ctk.CTk):
 
         self.toggle_vars: dict[str, tk.BooleanVar] = {}
         self.query_entries: dict[str, ctk.CTkEntry] = {}
+        self.min_price_entries: dict[str, ctk.CTkEntry] = {}
         self.price_entries: dict[str, ctk.CTkEntry] = {}
 
         for name in CATEGORIES:
@@ -589,8 +623,12 @@ class AvitoHunterApp(ctk.CTk):
             q_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
             self.query_entries[name] = q_entry
 
+            min_entry = ctk.CTkEntry(sub, placeholder_text="Мин ₽", width=75)
+            min_entry.grid(row=0, column=1, sticky="e", padx=(0, 4))
+            self.min_price_entries[name] = min_entry
+
             p_entry = ctk.CTkEntry(sub, placeholder_text="макс ₽", width=90)
-            p_entry.grid(row=0, column=1, sticky="e")
+            p_entry.grid(row=0, column=2, sticky="e")
             self.price_entries[name] = p_entry
 
     def _build_right_panel(self) -> None:
@@ -619,21 +657,22 @@ class AvitoHunterApp(ctk.CTk):
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
-        cols = ("score", "value", "category", "price", "delta", "delivery",
-                "title", "reasons")
+        cols = ("score", "ppf", "category", "price", "delta", "delivery",
+                "location", "title", "reasons")
         headings = {
             "score": "Балл",
-            "value": "Выгода (₽/FPS)",
+            "ppf": "Выгода (₽/FPS)",
             "category": "Категория",
             "price": "Цена ₽",
             "delta": "Динамика",
             "delivery": "Получение",
+            "location": "Город",
             "title": "Название",
             "reasons": "Причины оценки",
         }
         widths = {
-            "score": 70, "value": 110, "category": 120, "price": 90,
-            "delta": 90, "delivery": 120, "title": 420, "reasons": 260,
+            "score": 70, "ppf": 110, "category": 120, "price": 90,
+            "delta": 90, "delivery": 120, "location": 110, "title": 310, "reasons": 260,
         }
 
         style = ttk.Style()
@@ -650,7 +689,11 @@ class AvitoHunterApp(ctk.CTk):
 
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings")
         for c in cols:
-            self.tree.heading(c, text=headings[c])
+            self.tree.heading(
+                c,
+                text=headings[c],
+                command=lambda _c=c: self._sort_tree_column(_c, False),
+            )
             self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "title"))
         self.tree.grid(row=0, column=0, sticky="nsew")
 
@@ -665,6 +708,9 @@ class AvitoHunterApp(ctk.CTk):
 
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+        # сохраняем базовые заголовки для сортировки
+        self._tree_headings = dict(headings)
 
         # --- панель предпросмотра ---
         prev = ctk.CTkFrame(self.right)
@@ -710,7 +756,8 @@ class AvitoHunterApp(ctk.CTk):
         self.entry_city.insert(0, s.get("city", ""))
         self.entry_neighbors.insert(0, s.get("neighbor_cities", ""))
         self.spin_pages.insert(0, str(s.get("pages", 3)))
-        self.entry_stop.insert(0, s.get("stop_words", ""))
+        self.entry_stop.delete("1.0", "end")
+        self.entry_stop.insert("1.0", s.get("stop_words", ""))
         self.var_hide_seen.set(bool(s.get("hide_seen", True)))
 
         toggles = s.get("toggles", {})
@@ -720,6 +767,9 @@ class AvitoHunterApp(ctk.CTk):
                 self.toggle_vars[name].set(bool(data.get("enabled", False)))
                 if data.get("query"):
                     self.query_entries[name].insert(0, data["query"])
+                mp = data.get("min_price", 0)
+                if mp:
+                    self.min_price_entries[name].insert(0, str(mp))
                 mp = data.get("max_price", 0)
                 if mp:
                     self.price_entries[name].insert(0, str(mp))
@@ -730,13 +780,14 @@ class AvitoHunterApp(ctk.CTk):
             toggles[name] = {
                 "enabled": bool(self.toggle_vars[name].get()),
                 "query": self.query_entries[name].get().strip(),
+                "min_price": parse_int(self.min_price_entries[name].get(), 0),
                 "max_price": parse_int(self.price_entries[name].get(), 0),
             }
         return {
             "city": self.entry_city.get().strip() or "moskva",
             "neighbor_cities": self.entry_neighbors.get().strip(),
             "pages": max(1, min(30, parse_int(self.spin_pages.get(), 3))),
-            "stop_words": self.entry_stop.get().strip(),
+            "stop_words": self.entry_stop.get("1.0", "end").strip(),
             "hide_seen": bool(self.var_hide_seen.get()),
             "only_videocards": False,
             "channel": self.settings.get("channel", "msedge"),
@@ -770,7 +821,7 @@ class AvitoHunterApp(ctk.CTk):
                 cities.append(c)
 
         # Категории, у которых включён тумблер
-        active_categories: list[tuple[str, str, str, int]] = []
+        active_categories: list[tuple[str, str, str, int, int]] = []
         for name in CATEGORIES:
             data = self.settings["toggles"][name]
             if data["enabled"]:
@@ -778,6 +829,7 @@ class AvitoHunterApp(ctk.CTk):
                     name,
                     CATEGORIES[name],
                     data["query"],
+                    data["min_price"],
                     data["max_price"],
                 ))
 
@@ -787,7 +839,8 @@ class AvitoHunterApp(ctk.CTk):
             return
 
         pages = self.settings["pages"]
-        stop_words = [w.strip() for w in self.settings["stop_words"].split(",") if w.strip()]
+        raw_stop_text = self.settings.get("stop_words", "")
+        stop_words = [w.strip() for w in re.split(r"[,;\n]+", raw_stop_text) if w.strip()]
 
         self._stop_event.clear()
         self.btn_start.configure(state="disabled")
@@ -811,7 +864,7 @@ class AvitoHunterApp(ctk.CTk):
     def _run_parser(
         self,
         cities: list[str],
-        active_categories: list[tuple[str, str, str, int]],
+        active_categories: list[tuple[str, str, str, int, int]],
         pages: int,
         stop_words: list[str],
     ) -> None:
@@ -852,7 +905,7 @@ class AvitoHunterApp(ctk.CTk):
         self,
         page_obj: Any,
         cities: list[str],
-        active_categories: list[tuple[str, str, str, int]],
+        active_categories: list[tuple[str, str, str, int, int]],
         pages: int,
         stop_words: list[str],
         hide_seen: bool,
@@ -861,7 +914,7 @@ class AvitoHunterApp(ctk.CTk):
     ) -> None:
         done = 0
         for city in cities:
-            for cat_name, cat_path, query, max_price in active_categories:
+            for cat_name, cat_path, query, min_price, max_price in active_categories:
                 q_words = [w for w in query.split() if w]
                 last_first_id: Optional[str] = None
                 for page in range(1, pages + 1):
@@ -881,6 +934,7 @@ class AvitoHunterApp(ctk.CTk):
                             page=page,
                             q_words=q_words,
                             stop_words=stop_words,
+                            min_price=min_price,
                             max_price=max_price,
                         )
                         page_obj.wait_for_timeout(1800)
@@ -968,6 +1022,51 @@ class AvitoHunterApp(ctk.CTk):
     def _safe_status(self, text: str) -> None:
         self.after(0, lambda: self.status.configure(text=text))
 
+    def _bind_universal_clipboard(self) -> None:
+        """Ctrl+C/V/X/A для раскладок EN/RU на Linux и Windows.
+
+        ``event.keycode`` используется, потому что key-символ меняется
+        в зависимости от раскладки, а скан-код физической клавиши — нет.
+        """
+        def _on_ctrl(event: tk.Event) -> Optional[str]:
+            widget = event.widget
+            try:
+                wclass = widget.winfo_class()
+            except Exception:
+                return None
+            if wclass not in ("Entry", "Text"):
+                return None
+
+            key = event.keycode
+
+            # Выделить всё: A (Linux 38 / Windows 65)
+            if key in (38, 65):
+                if wclass == "Entry":
+                    widget.select_range(0, "end")
+                    widget.icursor("end")
+                else:
+                    widget.tag_add("sel", "1.0", "end")
+                return "break"
+
+            # Копировать: C (Linux 54 / Windows 67)
+            if key in (54, 67):
+                widget.event_generate("<<Copy>>")
+                return "break"
+
+            # Вырезать: X (Linux 53 / Windows 88)
+            if key in (53, 88):
+                widget.event_generate("<<Cut>>")
+                return "break"
+
+            # Вставить: V (Linux 55 / Windows 86)
+            if key in (55, 86):
+                widget.event_generate("<<Paste>>")
+                return "break"
+
+            return None
+
+        self.bind_all("<Control-KeyPress>", _on_ctrl)
+
     def on_stop(self) -> None:
         self._stop_event.set()
         self._safe_status("Остановка...")
@@ -989,6 +1088,7 @@ class AvitoHunterApp(ctk.CTk):
                 item.get("price", ""),
                 item.get("delta_text", ""),
                 item.get("delivery", ""),
+                item.get("location", ""),
                 item.get("title", ""),
                 item.get("reasons", ""),
             ),
@@ -1013,6 +1113,44 @@ class AvitoHunterApp(ctk.CTk):
             self._insert_row(item)
 
     # ---------------- клики по таблице ----------------
+    def _sort_tree_column(self, col: str, reverse: bool) -> None:
+        """Сортирует Treeview по клику на заголовок."""
+        # собираем пары (значение_для_сортировки, iid)
+        items: list[tuple[Any, str]] = []
+        for iid in self.tree.get_children():
+            val = self.tree.set(iid, col)
+            if col in ("price", "ppf"):
+                sort_val: Any = parse_int(val, 0)
+            else:
+                sort_val = str(val).lower()
+            items.append((sort_val, iid))
+
+        if col == "ppf":
+            # пустые / нулевые ppf принудительно в конец, вне зависимости от reverse
+            non_empty = [(v, iid) for v, iid in items if v != 0 and v != ""]
+            empty = [(v, iid) for v, iid in items if v == 0 or v == ""]
+            non_empty.sort(key=lambda x: x[0], reverse=reverse)
+            sorted_items = non_empty + empty
+        else:
+            sorted_items = sorted(items, key=lambda x: x[0], reverse=reverse)
+
+        # перемещаем строки в новом порядке
+        for index, (_, iid) in enumerate(sorted_items):
+            self.tree.move(iid, "", index)
+
+        # обновляем стрелки в заголовках
+        for c in self.tree["columns"]:
+            text = self._tree_headings.get(c, c)
+            if c == col:
+                text = f"{text} {'▼' if reverse else '▲'}"
+            self.tree.heading(c, text=text)
+
+        # следующий клик — обратный порядок
+        self.tree.heading(
+            col,
+            command=lambda _c=col: self._sort_tree_column(_c, not reverse),
+        )
+
     def on_tree_select(self, event: Any) -> None:
         sel = self.tree.selection()
         if not sel:
@@ -1147,7 +1285,7 @@ class AvitoHunterApp(ctk.CTk):
         ws = wb.active
         ws.title = "results"
         headers = ["Балл", "₽/FPS", "Категория", "Цена", "Динамика",
-                   "Получение", "Название", "Причины", "Ссылка", "Продавец"]
+                   "Получение", "Город", "Название", "Причины", "Ссылка", "Продавец"]
         ws.append(headers)
         for r in self.results:
             ws.append([
@@ -1157,6 +1295,7 @@ class AvitoHunterApp(ctk.CTk):
                 r.get("price", ""),
                 r.get("delta_text", ""),
                 r.get("delivery", ""),
+                r.get("location", ""),
                 r.get("title", ""),
                 r.get("reasons", ""),
                 r.get("url", ""),
