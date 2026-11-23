@@ -6,3 +6,4 @@ browser_profile/
 build/
 dist/
 *.spec
+settings.json

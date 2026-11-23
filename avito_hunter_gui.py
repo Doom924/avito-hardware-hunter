@@ -1,1357 +1,1082 @@
 """
-Avito Hunter — десктопное приложение для поиска и скоринга
-б/у комплектующих ПК на Авито.
+avito_hunter_gui.py — Avito PC-Parts Hunter & Scorer v2.0.0
+Полностью локальная архитектура. Никаких внешних серверов.
 
-Стек: CustomTkinter (dark theme) + Playwright (async, в отдельном потоке) + openpyxl.
+Ключевые особенности v2.0.0:
+- gpu_bench: локальный словарь + value-index
+- SQLite: история цен (seen_items) + ЧС продавцов (blacklisted_sellers)
+- автосохранение настроек в settings.json (включая 8 тумблеров, запросы, цены)
+- живой фильтр над таблицей + категория
+- панель предпросмотра + предупреждение о комиссии Авито
+- кнопка копирования вежливого сообщения продавцу
+- SmoothScrollFrame (Canvas + CTkScrollbar), кнопки закреплены сверху
+- точные URL-пути tovary_dlya_kompyutera/komplektuyuschie/...
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import os
-import queue
 import re
+import sqlite3
 import sys
+import time
 import threading
-import traceback
+import urllib.parse
 import webbrowser
-from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+import tkinter as tk
+from tkinter import ttk, messagebox
 
 import customtkinter as ctk
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
 
+# --- локальный модуль скоринга ---
 try:
-    from playwright.async_api import async_playwright, BrowserContext, Page
-except ImportError:  # позволит UI запуститься даже без Playwright
-    async_playwright = None  # type: ignore
-    BrowserContext = Any  # type: ignore
-    Page = Any  # type: ignore
-
-try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
+    from gpu_bench import calc_value_index, GPU_BENCHMARKS
 except ImportError:
-    Workbook = None  # type: ignore
+    # Мягкий фоллбэк, чтобы GUI запускался даже без gpu_bench.py
+    GPU_BENCHMARKS = {}
+    def calc_value_index(title: str, price: int) -> tuple[str, int]:
+        return "", 0
 
+# --- Playwright для парсинга ---
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+except ImportError:
+    sync_playwright = None
+    PWTimeout = Exception
 
-# =============================================================================
-#  КОНСТАНТЫ / ПАЛИТРА PRO-СТИЛЯ
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Константы
+# ---------------------------------------------------------------------------
+APP_TITLE = "Avito PC-Parts Hunter & Scorer v2.0.0"
+SETTINGS_FILE = "settings.json"
+DB_FILE = "hunter_history.db"
 
-APP_TITLE = "Avito Hunter — поиск и скоринг комплектующих"
-APP_GEOMETRY = "1400x900"
-BROWSER_PROFILE_DIR = "./browser_profile"
-AVITO_BASE = "https://www.avito.ru"
+BASE_URL = "https://www.avito.ru"
 
-# --- Палитра ---
-COLOR_BG            = "#0F172A"   # общий фон
-COLOR_SURFACE       = "#1E293B"   # карточки/секции
-COLOR_SURFACE_2     = "#111827"   # чуть темнее (поля)
-COLOR_BORDER        = "#334155"   # тонкая обводка
-COLOR_TEXT          = "#E2E8F0"   # основной текст
-COLOR_TEXT_DIM      = "#94A3B8"   # второстепенный текст
-COLOR_PRIMARY       = "#3B82F6"   # синий акцент
-COLOR_PRIMARY_HOVER = "#2563EB"
-COLOR_SUCCESS       = "#16A34A"
-COLOR_SUCCESS_HOVER = "#15803D"
-COLOR_WARN          = "#F59E0B"
-COLOR_DANGER        = "#DC2626"
+# 8 категорий с точными путями
+CATEGORIES: dict[str, str] = {
+    "Видеокарты": "/tovary_dlya_kompyutera/komplektuyuschie/videokarty",
+    "ОЗУ": "/tovary_dlya_kompyutera/komplektuyuschie/operativnaya_pamyat",
+    "Корпуса": "/tovary_dlya_kompyutera/komplektuyuschie/korpusa",
+    "Процессоры": "/tovary_dlya_kompyutera/komplektuyuschie/protsessory",
+    "Материнские платы": "/tovary_dlya_kompyutera/komplektuyuschie/materinskie_platy",
+    "Блоки питания": "/tovary_dlya_kompyutera/komplektuyuschie/bloki_pitaniya",
+    "Охлаждение": "/tovary_dlya_kompyutera/komplektuyuschie/ohlazhdenie",
+    "SSD": "/tovary_dlya_kompyutera/komplektuyuschie/ssd",
+}
 
-# --- Подсветка строк Treeview по баллам ---
-ROW_HIGH_BG  = "#14361F"   # >= 75 — зелёный
-ROW_MID_BG   = "#3B2F0B"   # 50–74 — жёлтый
-ROW_LOW_BG   = "#3B1212"   # < 50 — тускло-красный
-ROW_TEXT     = "#F1F5F9"
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "city": "moskva",
+    "neighbor_cities": "",
+    "pages": 3,
+    "stop_words": "нерабоч",            # стоп-слова через запятую
+    "hide_seen": True,                   # скрывать уже просмотренные
+    "only_videocards": False,            # legacy-флаг (совместимость)
+    "channel": "msedge",                 # браузерный канал
+    "toggles": {
+        name: {
+            "enabled": (name == "Видеокарты"),
+            "query": "",
+            "max_price": 0,
+        }
+        for name in CATEGORIES
+    },
+    "window_geometry": "1400x860",
+}
 
-DEFAULT_STOP_WORDS = (
-    "запчаст, нерабоч, сломан, артефакт, коробк, ошибка 43, "
-    "треугольник, дымок, отвал, только обмен, без претензий"
-)
-
-CATEGORIES: list[dict[str, str]] = [
-    {"key": "gpu",    "label": "Видеокарты",        "query_ph": "Напр: rx 580 8gb",
-     "url_path": "tovary_dlya_kompyutera/komplektuyuschie/videokarty"},
-    {"key": "ram",    "label": "Оперативная память", "query_ph": "Напр: ddr4 16gb",
-     "url_path": "tovary_dlya_kompyutera/komplektuyuschie/pamyat"},
-    {"key": "case",   "label": "Корпуса",            "query_ph": "Напр: корпус atx",
-     "url_path": "tovary_dlya_kompyutera/komplektuyuschie/korpusa"},
-    {"key": "cpu",    "label": "Процессоры",         "query_ph": "Напр: ryzen 5 5600",
-     "url_path": "tovary_dlya_kompyutera/komplektuyuschie/komplektuyuschie_dlya_pk"},
-    {"key": "mb",     "label": "Материнские платы",  "query_ph": "Напр: b450 am4",
-     "url_path": "tovary_dlya_kompyutera/komplektuyuschie/materinskie_platy"},
-    {"key": "psu",    "label": "Блоки питания",      "query_ph": "Напр: бп 600w",
-     "url_path": "tovary_dlya_kompyutera/komplektuyuschie/komplektuyuschie_dlya_pk"},
-    {"key": "cooler", "label": "Охлаждение",         "query_ph": "Напр: кулер башня",
-     "url_path": "tovary_dlya_kompyutera/komplektuyuschie/sistemy_ohlazhdeniya"},
-    {"key": "ssd",    "label": "SSD / Накопители",   "query_ph": "Напр: ssd m2 512gb",
-     "url_path": "tovary_dlya_kompyutera/komplektuyuschie/zhestkie_diski"},
-]
-
-POSITIVE_MARKERS = [
-    "тест", "проверен", "проверено", "гарантия", "пломб", "чек", "рабоч",
-    "рабочий", "работает", "без нареканий", "как новый",
-]
-RISK_MARKERS = [
-    "рефаб", "refurb", "на запчасти", "не работает", "нерабоч",
-    "не запускается", "битый", "сломан", "артефакт", "ошибка 43",
-    "треугольник", "только обмен", "без претензий",
-]
-
-
-# =============================================================================
-#  МОДЕЛИ ДАННЫХ
-# =============================================================================
-
-@dataclass
-class SearchConfig:
-    city_slug: str
-    nearby_cities: list[str]
-    stop_words: list[str]
-    filter_booking_and_rating: bool
-    filter_min_reviews: bool
-    filter_avito_delivery: bool
-    max_pages: int = 3
-    categories: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass
-class Listing:
-    title: str
-    url: str
-    price: Optional[int]
-    category: str
-    delivery: str
-    has_avito_delivery: bool
-    seller_rating: Optional[float]
-    seller_reviews: Optional[int]
-    is_booked: bool
-    score: int = 0
-    reasons: list[str] = field(default_factory=list)
-
-
-# =============================================================================
-#  УТИЛИТЫ
-# =============================================================================
-
-def parse_price(raw: str) -> Optional[int]:
-    if not raw:
-        return None
-    digits = re.sub(r"[^\d]", "", raw)
-    return int(digits) if digits else None
-
-
-def parse_reviews(raw: str) -> Optional[int]:
-    if not raw:
-        return None
-    low = raw.lower()
-    if "нет отзыв" in low or "без отзыв" in low:
-        return 0
-    digits = re.sub(r"[^\d]", "", raw)
-    return int(digits) if digits else None
-
-
-def parse_rating(raw: str) -> Optional[float]:
-    if not raw:
-        return None
-    m = re.search(r"\d+[.,]?\d*", raw)
-    if not m:
-        return None
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
+def parse_int(value: Any, default: int = 0) -> int:
     try:
-        return float(m.group(0).replace(",", "."))
-    except ValueError:
-        return None
+        return int(str(value).replace(" ", "").replace("₽", "").strip())
+    except (ValueError, TypeError):
+        return default
 
 
-def matches_stop_words(text: str, stop_words: list[str]) -> bool:
-    if not stop_words:
-        return False
-    low = text.lower()
-    return any(w and w in low for w in stop_words)
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_stop_words(raw: str) -> list[str]:
-    if not raw:
-        return []
-    parts = re.split(r"[,;|\n]+", raw)
-    return [p.strip().lower() for p in parts if p.strip()]
+def load_settings() -> dict[str, Any]:
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            merged = json.loads(json.dumps(DEFAULT_SETTINGS))
+            merged.update(data)
+            # Гарантируем наличие всех 8 тумблеров
+            tg = merged.setdefault("toggles", {})
+            for name in CATEGORIES:
+                tg.setdefault(name, {"enabled": False, "query": "", "max_price": 0})
+            return merged
+        except Exception:
+            pass
+    return json.loads(json.dumps(DEFAULT_SETTINGS))
 
 
-# =============================================================================
-#  СКОРИНГ
-# =============================================================================
-
-def score_listing(listing: Listing) -> None:
-    score = 50.0
-    reasons: list[str] = []
-
-    d = (listing.delivery or "").lower()
-    if "самовывоз" in d:
-        score += 10
-        reasons.append("самовывоз (+10)")
-    elif "доставка" in d:
-        score += 4
-        reasons.append("доставка (+4)")
-
-    if listing.has_avito_delivery:
-        score += 8
-        reasons.append("Авито Доставка (+8)")
-
-    r = listing.seller_rating
-    if r is not None:
-        if r >= 4.8:
-            score += 18
-            reasons.append(f"рейтинг {r} (+18)")
-        elif r >= 4.5:
-            score += 12
-            reasons.append(f"рейтинг {r} (+12)")
-        elif r >= 4.0:
-            score += 4
-            reasons.append(f"рейтинг {r} (+4)")
-        else:
-            score -= 15
-            reasons.append(f"низкий рейтинг {r} (-15)")
-
-    n = listing.seller_reviews
-    if n is not None:
-        if n >= 50:
-            score += 12
-            reasons.append(f"отзывов {n} (+12)")
-        elif n >= 10:
-            score += 7
-            reasons.append(f"отзывов {n} (+7)")
-        elif n >= 1:
-            score += 3
-            reasons.append(f"отзывов {n} (+3)")
-
-    text = (listing.title or "").lower()
-    for m in POSITIVE_MARKERS:
-        if m in text:
-            score += 3
-            reasons.append(f"маркер «{m}» (+3)")
-            break
-    for m in RISK_MARKERS:
-        if m in text:
-            score -= 12
-            reasons.append(f"риск «{m}» (-12)")
-            break
-
-    if listing.is_booked:
-        score -= 20
-        reasons.append("бронь (-20)")
-
-    score = max(0, min(100, round(score)))
-    listing.score = score
-    listing.reasons = reasons or ["—"]
+def save_settings(data: dict[str, Any]) -> None:
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Не удалось сохранить настройки:", e)
 
 
-# =============================================================================
-#  СКРОЛЛИРУЕМЫЙ КОНТЕЙНЕР (Canvas + CTkScrollbar, кросс-платформенный)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# SQLite-база истории
+# ---------------------------------------------------------------------------
+class HunterDB:
+    def __init__(self, path: str = DB_FILE):
+        self.path = path
+        self._lock = threading.Lock()
+        self._init()
 
-class ScrollableFrame(ctk.CTkFrame):
+    def _conn(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.path, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def _init(self) -> None:
+        with self._lock, self._conn() as c:
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS seen_items (
+                    item_id TEXT PRIMARY KEY,
+                    first_price INTEGER,
+                    last_price INTEGER,
+                    title TEXT,
+                    seller_name TEXT,
+                    seen_at TEXT
+                )"""
+            )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS blacklisted_sellers (
+                    seller_key TEXT PRIMARY KEY,
+                    reason TEXT
+                )"""
+            )
+
+    def upsert_item(self, item_id: str, price: int, title: str, seller: str) -> Optional[int]:
+        """Возвращает разницу (если цена снизилась), иначе None."""
+        if not item_id:
+            return None
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT last_price FROM seen_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                c.execute(
+                    "INSERT INTO seen_items(item_id, first_price, last_price, title, seller_name, seen_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (item_id, price, price, title, seller, now_str()),
+                )
+                return None
+            last = int(row["last_price"] or 0)
+            diff = last - price
+            if price < last:
+                c.execute(
+                    "UPDATE seen_items SET last_price = ?, seen_at = ? WHERE item_id = ?",
+                    (price, now_str(), item_id),
+                )
+                return diff
+            # просто обновим метку времени
+            c.execute("UPDATE seen_items SET seen_at = ? WHERE item_id = ?", (now_str(), item_id))
+            return None
+
+    def is_blacklisted(self, seller_key: str) -> bool:
+        if not seller_key:
+            return False
+        with self._lock, self._conn() as c:
+            r = c.execute(
+                "SELECT 1 FROM blacklisted_sellers WHERE seller_key = ?", (seller_key,)
+            ).fetchone()
+            return r is not None
+
+    def blacklist_seller(self, seller_key: str, reason: str = "") -> None:
+        if not seller_key:
+            return
+        with self._lock, self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO blacklisted_sellers(seller_key, reason) VALUES (?,?)",
+                (seller_key, reason),
+            )
+
+    def get_blacklist(self) -> list[tuple[str, str]]:
+        with self._lock, self._conn() as c:
+            return [(r["seller_key"], r["reason"]) for r in c.execute(
+                "SELECT * FROM blacklisted_sellers"
+            )]
+
+    def close(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Надёжный SmoothScrollFrame (без CTkScrollableFrame!)
+# ---------------------------------------------------------------------------
+class SmoothScrollFrame(ctk.CTkFrame):
     """
-    Надёжный скроллируемый контейнер на базе tkinter.Canvas + CTkScrollbar.
-    Не схлопывается по высоте на Arch Linux / Wayland (в отличие от CTkScrollableFrame).
-    Поддерживает плавный скролл колесом мыши: Windows (<MouseWheel>) и Linux (<Button-4>/<Button-5>).
+    Canvas + CTkScrollbar + колесо мыши.
+    Работает стабильно на Linux и Windows.
     """
 
-    _SCROLL_STEP = 3  # единиц прокрутки за «щелчок»
-
-    def __init__(self, master, **kwargs) -> None:
-        super().__init__(master, fg_color="transparent", **kwargs)
-
-        self._canvas = tk.Canvas(
-            self,
-            bg=COLOR_BG,
-            highlightthickness=0,
-            bd=0,
-        )
-        self._canvas.grid(row=0, column=0, sticky="nsew")
-
-        self._scrollbar = ctk.CTkScrollbar(
-            self, orientation="vertical", command=self._canvas.yview
-        )
-        self._scrollbar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
-        self._canvas.configure(yscrollcommand=self._scrollbar.set)
-
-        self.grid_rowconfigure(0, weight=1)
+    def __init__(self, master: Any, **kwargs: Any):
+        super().__init__(master, **kwargs)
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        # Внутренний frame с содержимым
-        self.inner = ctk.CTkFrame(self._canvas, fg_color="transparent")
-        self._inner_id = self._canvas.create_window(
+        self.canvas = tk.Canvas(
+            self, highlightthickness=0, bd=0, bg=self._bg(),
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.scrollbar = ctk.CTkScrollbar(self, command=self.canvas.yview)
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.inner = ctk.CTkFrame(self.canvas, fg_color="transparent")
+        self.inner_id = self.canvas.create_window(
             (0, 0), window=self.inner, anchor="nw"
         )
 
-        # Обновляем scrollregion при изменении размеров содержимого
         self.inner.bind("<Configure>", self._on_inner_configure)
-        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Кросс-платформенная привязка колеса
-        self._bind_mousewheel()
+        # Колесо мыши для Windows / macOS
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Linux
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
 
-    def _on_inner_configure(self, _event=None) -> None:
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-
-    def _on_canvas_configure(self, event) -> None:
-        # внутренний frame всегда по ширине canvas
-        self._canvas.itemconfigure(self._inner_id, width=event.width)
-
-    def _bind_mousewheel(self) -> None:
-        # Windows / macOS
-        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
-        # Linux (X11)
-        self._canvas.bind_all("<Button-4>", self._on_button4, add="+")
-        self._canvas.bind_all("<Button-5>", self._on_button5, add="+")
-
-    def _should_scroll(self, event) -> bool:
-        """
-        Скроллим только если курсор мыши находится над этим контейнером
-        или одним из его потомков. Иначе — не мешаем другим скроллам.
-        """
-        widget = event.widget
+    def _bg(self) -> str:
         try:
-            while widget is not None:
-                if widget == self._canvas or widget == self.inner:
-                    return True
-                widget = widget.master  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
-            pass
-        # fallback: проверяем геометрию
-        try:
-            x_root, y_root = event.x_root, event.y_root
-            cx = self._canvas.winfo_rootx()
-            cy = self._canvas.winfo_rooty()
-            cw = self._canvas.winfo_width()
-            ch = self._canvas.winfo_height()
-            return cx <= x_root <= cx + cw and cy <= y_root <= cy + ch
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _on_mousewheel(self, event) -> None:
-        if not self._should_scroll(event):
-            return
-        delta = -1 if event.delta > 0 else 1
-        self._canvas.yview_scroll(delta * self._SCROLL_STEP, "units")
-
-    def _on_button4(self, event) -> None:
-        if not self._should_scroll(event):
-            return
-        self._canvas.yview_scroll(-self._SCROLL_STEP, "units")
-
-    def _on_button5(self, event) -> None:
-        if not self._should_scroll(event):
-            return
-        self._canvas.yview_scroll(self._SCROLL_STEP, "units")
-
-
-# =============================================================================
-#  ПАРСЕР (Playwright, async) — с пагинацией
-# =============================================================================
-
-class AvitoParser:
-    def __init__(
-        self,
-        config: SearchConfig,
-        out_queue: "queue.Queue[tuple[str, Any]]",
-        stop_event: threading.Event,
-    ) -> None:
-        self.config = config
-        self.q = out_queue
-        self.stop_event = stop_event
-
-    def run(self) -> None:
-        try:
-            asyncio.run(self._run_async())
-        except Exception as exc:  # noqa: BLE001
-            tb = traceback.format_exc()
-            self.q.put(("error", f"{exc}\n\n{tb}"))
-        finally:
-            self.q.put(("done", None))
-
-    async def _run_async(self) -> None:
-        if async_playwright is None:
-            self.q.put(
-                ("error", "Playwright не установлен. Выполните:\n  pip install playwright\n  playwright install")
+            return ctk.get_appearance_mode().lower() and (
+                "#1e1e1e" if ctk.get_appearance_mode().lower() == "dark" else "#dbdbdb"
             )
-            return
+        except Exception:
+            return "#1e1e1e"
 
-        async with async_playwright() as pw:
-            context: BrowserContext = await self._launch(pw)
-            try:
-                page = await context.new_page()
-                total_cats = len(self.config.categories)
-                for idx, cat in enumerate(self.config.categories, 1):
-                    if self.stop_event.is_set():
-                        break
-                    self.q.put((
-                        "log",
-                        f"[{idx}/{total_cats}] Категория: {cat['label']} "
-                        f"(до {self.config.max_pages} стр.)",
-                    ))
-                    try:
-                        await self._parse_category(page, cat)
-                    except Exception as exc:  # noqa: BLE001
-                        self.q.put(("log", f"  ! Ошибка в категории «{cat['label']}»: {exc}"))
-                    await asyncio.sleep(0.5)
-            finally:
-                try:
-                    await context.close()
-                except Exception:  # noqa: BLE001
-                    pass
+    def _on_inner_configure(self, event: tk.Event) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-    async def _launch(self, pw) -> BrowserContext:
-        profile_path = str(Path(BROWSER_PROFILE_DIR).resolve())
-        Path(profile_path).mkdir(parents=True, exist_ok=True)
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self.inner_id, width=event.width)
 
-        common = dict(
-            user_data_dir=profile_path,
-            headless=False,
-            viewport={"width": 1366, "height": 900},
-            locale="ru-RU",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        try:
+            if getattr(event, "num", None) == 4:
+                self.canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                self.canvas.yview_scroll(1, "units")
+            else:
+                delta = getattr(event, "delta", 0)
+                step = -1 if delta > 0 else 1
+                self.canvas.yview_scroll(step * max(1, abs(delta) // 120), "units")
+        except Exception:
+            pass
 
-        if sys.platform == "win32":
-            try:
-                ctx = await pw.chromium.launch_persistent_context(channel="msedge", **common)
-                self.q.put(("log", "Браузер: системный Edge (msedge)"))
-                return ctx
-            except Exception:  # noqa: BLE001
-                self.q.put(("log", "Edge недоступен, откат на Chromium..."))
 
-        ctx = await pw.chromium.launch_persistent_context(**common)
-        self.q.put(("log", "Браузер: Chromium (Playwright)"))
-        return ctx
+# ---------------------------------------------------------------------------
+# Парсер Авито (Playwright)
+# ---------------------------------------------------------------------------
+def build_search_url(city: str, category_path: str, query: str, page: int) -> str:
+    q = urllib.parse.quote(query) if query else ""
+    url = f"{BASE_URL}/{city}{category_path}"
+    params = []
+    if q:
+        params.append(f"q={q}")
+    if page > 1:
+        params.append(f"p={page}")
+    if params:
+        url += "?" + "&".join(params)
+    return url
 
-    def _build_url(self, cat: dict[str, Any], page_num: int = 1) -> str:
-        slug = (self.config.city_slug or "rossiya").strip()
-        path = cat["url_path"]
-        url = f"{AVITO_BASE}/{slug}/{path}"
-        params: list[str] = []
-        q = (cat.get("query") or "").strip()
-        if q:
-            params.append(f"q={q.replace(' ', '+')}")
-        max_price = cat.get("max_price")
-        if max_price:
-            params.append(f"pmax={max_price}")
-        if page_num > 1:
-            params.append(f"p={page_num}")
-        if params:
-            url += "?" + "&".join(params)
-        return url
 
-    async def _parse_category(self, page: Page, cat: dict[str, Any]) -> None:
-        total_new = 0
-        seen_ids: set[str] = set()
-        for page_num in range(1, max(1, self.config.max_pages) + 1):
-            if self.stop_event.is_set():
-                return
-            url = self._build_url(cat, page_num)
-            self.q.put(("log", f"  → стр. {page_num}: {url}"))
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            except Exception as exc:  # noqa: BLE001
-                self.q.put(("log", f"  ! Не удалось открыть стр. {page_num}: {exc}"))
-                break
+def extract_item_id(href: str) -> str:
+    m = re.search(r"_(\d{6,})(?:\?|$)", href)
+    return m.group(1) if m else ""
 
-            try:
-                await page.wait_for_selector('[data-marker="item"]', timeout=20_000)
-            except Exception:
-                self.q.put((
-                    "log",
-                    f"  ! Стр. {page_num}: нет объявлений (капча/антибот или конец выдачи).",
-                ))
-                break
 
-            # 3 плавных скролла для подгрузки всех 50 объявлений страницы
-            for _ in range(3):
-                if self.stop_event.is_set():
-                    return
-                try:
-                    await page.mouse.wheel(0, 2000)
-                except Exception:  # noqa: BLE001
-                    pass
-                await asyncio.sleep(0.7)
+def contains_stop_words(text: str, stop_words: list[str]) -> bool:
+    low = text.lower()
+    return any(w and w.lower() in low for w in stop_words)
 
-            if page_num > 1 and f"p={page_num}" not in page.url:
-                self.q.put(("log", f"  · Стр. {page_num}: Авито вернул начальную страницу, конец выдачи."))
-                break
 
-            cards = await page.query_selector_all('[data-marker="item"]')
-            if not cards:
-                self.q.put(("log", f"  · Стр. {page_num}: карточек 0, завершаем категорию."))
-                break
+def detect_delivery_commission(desc: str) -> Optional[str]:
+    low = (desc or "").lower()
+    for marker in ("комиссия", "+7%", "+9%"):
+        if marker.lower() in low:
+            return marker
+    return None
 
-            page_ids = [await c.get_attribute("data-item-id") for c in cards]
-            new_ids = {i for i in page_ids if i and i not in seen_ids}
-            if not new_ids:
-                self.q.put(("log", f"  · Стр. {page_num}: новых объявлений нет (повтор выдачи), завершаем."))
-                break
-            seen_ids.update(new_ids)
 
-            self.q.put(("log", f"  · Стр. {page_num}: найдено карточек {len(cards)}"))
-
-            parsed_on_page = 0
-            for card in cards:
-                if self.stop_event.is_set():
-                    return
-                try:
-                    listing = await self._parse_card(card, cat)
-                except Exception:  # noqa: BLE001
-                    continue
-                if listing is None:
-                    continue
-
-                if matches_stop_words(listing.title, self.config.stop_words):
-                    continue
-
-                if self.config.filter_avito_delivery and not listing.has_avito_delivery:
-                    continue
-
-                if self.config.filter_booking_and_rating:
-                    if listing.seller_rating is not None and listing.seller_rating < 4.5:
-                        self.q.put((
-                            "log",
-                            f"  ✗ отсеян (рейтинг {listing.seller_rating}): {listing.title[:60]}",
-                        ))
-                        continue
-                    if listing.is_booked:
-                        continue
-
-                if self.config.filter_min_reviews:
-                    if listing.seller_reviews is None or listing.seller_reviews <= 0:
-                        continue
-
-                score_listing(listing)
-                self.q.put(("row", listing))
-                parsed_on_page += 1
-                total_new += 1
-                await asyncio.sleep(0.02)
-
-            self.q.put(("log", f"  ✓ Стр. {page_num}: прошло фильтры {parsed_on_page}"))
-
-            # Если на странице было мало карточек (< 40) — это последняя страница
-            if len(cards) < 40:
-                self.q.put(("log", f"  · Похоже, стр. {page_num} — последняя."))
-                break
-
-        self.q.put(("log", f"  ∑ По категории «{cat['label']}» добавлено: {total_new}"))
-
-    async def _parse_card(self, card, cat: dict[str, Any]) -> Optional[Listing]:
-        title_el = await card.query_selector('[data-marker="item-title"]')
-        if not title_el:
-            return None
-        title = (await title_el.inner_text()).strip()
-        rel = await title_el.get_attribute("href") or ""
-        if rel.startswith("/"):
-            url = AVITO_BASE + rel
-        elif rel.startswith("http"):
-            url = rel
+def scrape_page(
+    page_obj: Any,
+    city: str,
+    category_name: str,
+    category_path: str,
+    query: str,
+    page: int,
+    q_words: list[str],
+    stop_words: list[str],
+    max_price: int,
+) -> list[dict[str, Any]]:
+    """Возвращает список карточек с одной страницы, используя единую вкладку."""
+    url = build_search_url(city, category_path, query, page)
+    results: list[dict[str, Any]] = []
+    try:
+        page_obj.goto(url, timeout=45000, wait_until="domcontentloaded")
+        if "проблем с ip" in page_obj.content().lower() or "доступ ограничен" in page_obj.title().lower():
+            print("[scrape] Авито запросил проверку! Нажмите 'Пройти проверку' в окне браузера...")
+            page_obj.wait_for_selector('[data-marker="item"]', timeout=120000)
         else:
-            return None
+            try:
+                page_obj.wait_for_selector('[data-marker="item"]', timeout=15000)
+            except PWTimeout:
+                pass
+        for _ in range(3):
+            page_obj.mouse.wheel(0, 2000)
+            page_obj.wait_for_timeout(600)
+    except Exception as e:
+        print(f"[scrape] ошибка загрузки {url}: {e}")
+        return results
 
-        price_el = await card.query_selector('[data-marker="item-price"]')
-        price = parse_price(await price_el.inner_text()) if price_el else None
+    cards = page_obj.query_selector_all('[data-marker="item"]')
+    for card in cards:
+        try:
+            title_el = card.query_selector('[itemprop="name"], [data-marker="item-title"]')
+            title = title_el.inner_text().strip() if title_el else ""
 
-        body = (await card.inner_text()) or ""
-        body_low = body.lower()
+            price_el = card.query_selector('[itemprop="price"]')
+            price_text = price_el.get_attribute("content") if price_el else ""
+            price = parse_int(price_text)
 
-        delivery = "—"
-        if "самовывоз" in body_low:
-            delivery = "Самовывоз"
-        elif "доставка" in body_low:
-            delivery = "Доставка"
+            link_el = card.query_selector("a[itemprop='url'], a[data-marker='item-title']")
+            href = link_el.get_attribute("href") if link_el else ""
+            full_url = BASE_URL + href if href and href.startswith("/") else href
+            item_id = extract_item_id(href or "")
 
-        has_avito_delivery = False
-        avito_badge = await card.query_selector(
-            '[data-marker*="delivery"], [data-marker*="badge/avito"], '
-            '[class*="avito-delivery"], [class*="item-badge"][class*="delivery"]'
-        )
-        if avito_badge:
-            has_avito_delivery = True
-        if not has_avito_delivery and (
-            "авито доставка" in body_low
-            or "avito доставка" in body_low
-            or "доставка авито" in body_low
-        ):
-            has_avito_delivery = True
+            seller_el = card.query_selector('[data-marker="seller-info/name"]')
+            seller = seller_el.inner_text().strip() if seller_el else ""
 
-        is_booked = "бронь" in body_low or "забронировано" in body_low
+            # фильтр по ключевым словам
+            if q_words and not any(w.lower() in title.lower() for w in q_words):
+                continue
+            if stop_words and contains_stop_words(title, stop_words):
+                continue
+            if max_price and price > max_price:
+                continue
 
-        seller_rating: Optional[float] = None
-        seller_reviews: Optional[int] = None
+            # достаём полное описание (осторожно, дорого — только тут)
+            description = ""
+            try:
+                title_el2 = card.query_selector('[data-marker="item-specific-params"]')
+                if title_el2:
+                    description = title_el2.inner_text().strip()
+            except Exception:
+                pass
 
-        score_el = await card.query_selector('[data-marker="seller-rating/score"]')
-        if score_el:
-            seller_rating = parse_rating(await score_el.inner_text() or "")
+            results.append({
+                "item_id": item_id,
+                "title": title,
+                "price": price,
+                "url": full_url,
+                "seller": seller,
+                "category": category_name,
+                "description": description,
+            })
+        except Exception:
+            continue
 
-        summary_el = await card.query_selector('[data-marker="seller-info/summary"]')
-        if summary_el:
-            summary_text = (await summary_el.inner_text()) or ""
-            if seller_rating is None:
-                seller_rating = parse_rating(summary_text)
-            seller_reviews = parse_reviews(summary_text)
-
-        if seller_rating is None:
-            m = re.search(r"(\d+[.,]\d+)\s*★", body)
-            if m:
-                seller_rating = parse_rating(m.group(1))
-
-        if seller_reviews is None:
-            m = re.search(r"(\d+)\s*отзыв", body_low)
-            if m:
-                seller_reviews = int(m.group(1))
-            elif "нет отзыв" in body_low:
-                seller_reviews = 0
-
-        return Listing(
-            title=title,
-            url=url,
-            price=price,
-            category=cat["label"],
-            delivery=delivery,
-            has_avito_delivery=has_avito_delivery,
-            seller_rating=seller_rating,
-            seller_reviews=seller_reviews,
-            is_booked=is_booked,
-        )
+    return results
 
 
-# =============================================================================
-#  ЭКСПОРТ В EXCEL
-# =============================================================================
-
-def export_to_excel(rows: list[Listing], path: str) -> None:
-    if Workbook is None:
-        raise RuntimeError("openpyxl не установлен. Выполните: pip install openpyxl")
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Avito Hunter"
-
-    headers = [
-        "Балл", "Категория", "Цена ₽", "Получение", "Авито Доставка",
-        "Название", "Причины оценки", "Ссылка",
-    ]
-    ws.append(headers)
-
-    header_fill = PatternFill("solid", fgColor="1E293B")
-    header_font = Font(bold=True, color="E2E8F0")
-    for col_idx, _ in enumerate(headers, 1):
-        c = ws.cell(row=1, column=col_idx)
-        c.fill = header_fill
-        c.font = header_font
-        c.alignment = Alignment(horizontal="center", vertical="center")
-
-    for r in rows:
-        ws.append([
-            r.score,
-            r.category,
-            r.price if r.price is not None else "",
-            r.delivery,
-            "да" if r.has_avito_delivery else "нет",
-            r.title,
-            "; ".join(r.reasons),
-            r.url,
-        ])
-
-    widths = [8, 22, 10, 14, 14, 55, 45, 60]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    ws.freeze_panes = "A2"
-    wb.save(path)
-
-
-# =============================================================================
-#  GUI
-# =============================================================================
-
+# ---------------------------------------------------------------------------
+# Главное окно
+# ---------------------------------------------------------------------------
 class AvitoHunterApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        self.settings = load_settings()
+        self.db = HunterDB()
 
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
-        self.configure(fg_color=COLOR_BG)
+        ctk.set_default_color_theme("blue")
 
         self.title(APP_TITLE)
-        self.geometry(APP_GEOMETRY)
-        self.minsize(1100, 700)
-
-        self.results: list[Listing] = []
-        self.result_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
-        self.stop_event = threading.Event()
-        self.worker_thread: Optional[threading.Thread] = None
-        self._worker_running = False
-        self._sort_reverse: dict[str, bool] = {}
-
-        self.cat_widgets: dict[str, dict[str, Any]] = {}
-
-        # --- шрифты ---
-        self.font_h1 = ctk.CTkFont(family="Segoe UI", size=16, weight="bold")
-        self.font_h2 = ctk.CTkFont(family="Segoe UI", size=14, weight="bold")
-        self.font_body = ctk.CTkFont(family="Segoe UI", size=12)
-        self.font_small = ctk.CTkFont(family="Segoe UI", size=11)
-        self.font_button = ctk.CTkFont(family="Segoe UI", size=14, weight="bold")
-
-        self._build_ui()
-        self._poll_queue()
-
-    # ------------------------------------------------------------------ UI
-    def _build_ui(self) -> None:
-        self.tabview = ctk.CTkTabview(
-            self,
-            fg_color=COLOR_BG,
-            segmented_button_selected_color=COLOR_PRIMARY,
-            segmented_button_selected_hover_color=COLOR_PRIMARY_HOVER,
-            segmented_button_unselected_color=COLOR_SURFACE,
-            segmented_button_unselected_hover_color=COLOR_SURFACE_2,
-            text_color=COLOR_TEXT,
-        )
-        self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
-
-        self.tab_search = self.tabview.add("🔍 Поиск и скоринг")
-        self.tab_help = self.tabview.add("📖 Инструкция и справочник")
-
-        self._build_search_tab()
-        self._build_help_tab()
-
-    # -------------------------------------------------------- вкладка поиска
-    def _build_search_tab(self) -> None:
-        # Двухколоночный layout
-        self.tab_search.grid_rowconfigure(0, weight=1)
-        self.tab_search.grid_columnconfigure(0, weight=0, minsize=440)
-        self.tab_search.grid_columnconfigure(1, weight=1)
-
-        # === ЛЕВАЯ КОЛОНКА: закреплённые кнопки + скролл-область ===
-        left_wrap = ctk.CTkFrame(
-            self.tab_search,
-            fg_color=COLOR_SURFACE,
-            corner_radius=10,
-            border_width=1,
-            border_color=COLOR_BORDER,
-        )
-        left_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=4)
-        left_wrap.grid_rowconfigure(1, weight=1)
-        left_wrap.grid_columnconfigure(0, weight=1)
-
-        # --- Закреплённый верх: заголовок + кнопки ---
-        top_sticky = ctk.CTkFrame(left_wrap, fg_color="transparent")
-        top_sticky.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
-
-        ctk.CTkLabel(
-            top_sticky, text="⚙️ Настройки поиска",
-            font=self.font_h1, text_color=COLOR_TEXT, anchor="w",
-        ).pack(fill="x", pady=(0, 8))
-
-        self.start_btn = ctk.CTkButton(
-            top_sticky, text="🚀 Запустить поиск", height=42,
-            font=self.font_button,
-            fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER,
-            corner_radius=8,
-            command=self._on_start_search,
-        )
-        self.start_btn.pack(fill="x", pady=(0, 6))
-
-        self.save_btn = ctk.CTkButton(
-            top_sticky, text="📊 Сохранить в Excel (.xlsx)", height=38,
-            font=self.font_button,
-            fg_color=COLOR_SUCCESS, hover_color=COLOR_SUCCESS_HOVER,
-            corner_radius=8,
-            command=self._on_save_excel,
-        )
-        self.save_btn.pack(fill="x", pady=(0, 6))
-
-        # --- Прокручиваемая область ---
-        self.left_scroll = ScrollableFrame(left_wrap)
-        self.left_scroll.grid(row=1, column=0, sticky="nsew", padx=(6, 6), pady=(0, 8))
-        left = self.left_scroll.inner
-
-        # --- Поля города ---
-        sec_city = self._make_section(left, "📍 Город и окружение")
-        self.city_entry = ctk.CTkEntry(
-            sec_city,
-            placeholder_text="Slug города, напр: pervouralsk (пусто = rossiya)",
-            fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER,
-            text_color=COLOR_TEXT, placeholder_text_color=COLOR_TEXT_DIM,
-        )
-        self.city_entry.pack(fill="x", padx=8, pady=(0, 6))
-
-        self.nearby_entry = ctk.CTkEntry(
-            sec_city,
-            placeholder_text="Города рядом через запятую...",
-            fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER,
-            text_color=COLOR_TEXT, placeholder_text_color=COLOR_TEXT_DIM,
-        )
-        self.nearby_entry.pack(fill="x", padx=8, pady=(0, 6))
-
-        # Глубина поиска
-        ctk.CTkLabel(
-            sec_city, text="Глубина поиска (страниц)",
-            font=self.font_body, text_color=COLOR_TEXT_DIM, anchor="w",
-        ).pack(fill="x", padx=8, pady=(2, 2))
-        self.pages_entry = ctk.CTkEntry(
-            sec_city,
-            placeholder_text="3 (≈150 объявлений на категорию)",
-            fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER,
-            text_color=COLOR_TEXT, placeholder_text_color=COLOR_TEXT_DIM,
-        )
-        self.pages_entry.insert(0, "3")
-        self.pages_entry.pack(fill="x", padx=8, pady=(0, 8))
-
-        # --- Категории ---
-        sec_cats = self._make_section(left, "🧩 Категории")
-        for cat in CATEGORIES:
-            self._build_category_block(sec_cats, cat)
-
-        # --- Стоп-слова ---
-        sec_stop = self._make_section(left, "🛑 Стоп-слова")
-        ctk.CTkLabel(
-            sec_stop,
-            text="Разделители: ,  ;  |  или Enter",
-            font=self.font_small, text_color=COLOR_TEXT_DIM, anchor="w",
-        ).pack(fill="x", padx=8, pady=(0, 4))
-
-        self.stop_words_box = ctk.CTkTextbox(
-            sec_stop, height=100,
-            fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER,
-            text_color=COLOR_TEXT,
-        )
-        self.stop_words_box.pack(fill="x", padx=8, pady=(0, 6))
-
-        ctk.CTkButton(
-            sec_stop, text="Заполнить базовые стоп-слова",
-            font=self.font_body,
-            fg_color=COLOR_SURFACE_2, hover_color="#475569",
-            border_width=1, border_color=COLOR_BORDER,
-            command=self._fill_default_stop_words,
-        ).pack(fill="x", padx=8, pady=(0, 8))
-
-        # --- Фильтры ---
-        sec_filters = self._make_section(left, "🎯 Фильтры надёжности")
-        self.filter_booking_var = ctk.BooleanVar(value=False)
-        self.filter_min_reviews_var = ctk.BooleanVar(value=True)
-        self.filter_avito_delivery_var = ctk.BooleanVar(value=False)
-
-        for text, var in [
-            ("Отсекать бронь и рейтинг продавца < 4.5", self.filter_booking_var),
-            ("Только продавцы с историей продаж (отзывы > 0)", self.filter_min_reviews_var),
-            ("Только с Авито Доставкой", self.filter_avito_delivery_var),
-        ]:
-            ctk.CTkCheckBox(
-                sec_filters, text=text, variable=var,
-                font=self.font_body, text_color=COLOR_TEXT,
-                fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER,
-                checkmark_color="white",
-            ).pack(anchor="w", padx=8, pady=4)
-
-        # --- Статус (внизу прокрутки) ---
-        self.status_label = ctk.CTkLabel(
-            left, text="Готов к работе",
-            font=self.font_small, text_color=COLOR_TEXT_DIM, anchor="w",
-            wraplength=380, justify="left",
-        )
-        self.status_label.pack(fill="x", padx=8, pady=(6, 12))
-
-        # === ПРАВАЯ КОЛОНКА: результаты ===
-        right = ctk.CTkFrame(
-            self.tab_search,
-            fg_color=COLOR_SURFACE,
-            corner_radius=10,
-            border_width=1,
-            border_color=COLOR_BORDER,
-        )
-        right.grid(row=0, column=1, sticky="nsew", pady=4)
-        right.grid_rowconfigure(1, weight=1)
-        right.grid_columnconfigure(0, weight=1)
-
-        header = ctk.CTkFrame(right, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
-        ctk.CTkLabel(
-            header, text="📋 Результаты",
-            font=self.font_h1, text_color=COLOR_TEXT,
-        ).pack(side="left")
-        self.counter_label = ctk.CTkLabel(
-            header, text="0 объявлений",
-            font=self.font_body, text_color=COLOR_TEXT_DIM,
-        )
-        self.counter_label.pack(side="right")
-
-        # --- Treeview ---
-        style = ttk.Style()
         try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure(
-            "Avito.Treeview",
-            background=COLOR_SURFACE_2, fieldbackground=COLOR_SURFACE_2,
-            foreground=ROW_TEXT, rowheight=28, borderwidth=0,
-            font=("Segoe UI", 10),
-        )
-        style.configure(
-            "Avito.Treeview.Heading",
-            background=COLOR_SURFACE, foreground=COLOR_TEXT,
-            relief="flat", font=("Segoe UI", 10, "bold"),
-        )
-        style.map("Avito.Treeview", background=[("selected", COLOR_PRIMARY)])
-        style.map("Avito.Treeview.Heading", background=[("active", "#475569")])
+            self.geometry(self.settings.get("window_geometry", "1400x860"))
+        except Exception:
+            self.geometry("1400x860")
 
-        tree_frame = ctk.CTkFrame(right, fg_color="transparent")
-        tree_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        tree_frame.grid_rowconfigure(0, weight=1)
-        tree_frame.grid_columnconfigure(0, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        columns = ("score", "category", "price", "delivery", "avito_delivery", "title", "reasons")
-        self.tree = ttk.Treeview(
-            tree_frame, columns=columns, show="headings",
-            style="Avito.Treeview", selectmode="browse",
+        # --- состояние ---
+        self._stop_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self.results: list[dict[str, Any]] = []
+        self.selected_item: Optional[dict[str, Any]] = None
+        self._item_meta: dict[str, dict[str, Any]] = {}  # iid -> полный dict карточки
+
+        # --- UI ---
+        self._build_ui()
+        self._restore_settings_to_ui()
+
+    # ---------------- UI ----------------
+    def _build_ui(self) -> None:
+        self.grid_columnconfigure(0, weight=0)  # левая панель фикс. ширина
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.left = ctk.CTkFrame(self, width=340)
+        self.left.grid(row=0, column=0, sticky="ns", padx=(8, 4), pady=8)
+        self.left.grid_propagate(False)
+
+        self.right = ctk.CTkFrame(self)
+        self.right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        self.right.grid_rowconfigure(1, weight=1)
+        self.right.grid_columnconfigure(0, weight=1)
+
+        self._build_left_panel()
+        self._build_right_panel()
+
+    def _build_left_panel(self) -> None:
+        # ---- ЗАКРЕПЛЁННЫЕ КНОПКИ СВЕРХУ ----
+        btn_bar = ctk.CTkFrame(self.left, fg_color="transparent")
+        btn_bar.pack(side="top", fill="x", padx=6, pady=(8, 4))
+        btn_bar.grid_columnconfigure((0, 1, 2), weight=1)
+
+        self.btn_start = ctk.CTkButton(
+            btn_bar, text="🚀 Запустить поиск", command=self.on_start,
+            fg_color="#1f6feb", hover_color="#1a5cc0",
         )
+        self.btn_start.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+
+        self.btn_stop = ctk.CTkButton(
+            btn_bar, text="⏹ Стоп", command=self.on_stop,
+            fg_color="#b91c1c", hover_color="#991b1b", state="disabled",
+        )
+        self.btn_stop.grid(row=0, column=1, padx=4, sticky="ew")
+
+        self.btn_excel = ctk.CTkButton(
+            btn_bar, text="📊 Сохранить в Excel", command=self.on_save_excel,
+            fg_color="#15803d", hover_color="#166534",
+        )
+        self.btn_excel.grid(row=0, column=2, padx=(4, 0), sticky="ew")
+
+        # ---- ПРОКРУЧИВАЕМАЯ ЗОНА НАСТРОЕК ----
+        self.left_scroll = SmoothScrollFrame(self.left)
+        self.left_scroll.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+        inner = self.left_scroll.inner
+
+        # --- базовые настройки ---
+        base = ctk.CTkFrame(inner)
+        base.pack(fill="x", padx=4, pady=4)
+        ctk.CTkLabel(base, text="Город (slug):").pack(anchor="w", padx=8, pady=(8, 0))
+        self.entry_city = ctk.CTkEntry(base)
+        self.entry_city.pack(fill="x", padx=8, pady=2)
+
+        ctk.CTkLabel(base, text="Соседние города (через запятую):").pack(anchor="w", padx=8, pady=(8, 0))
+        self.entry_neighbors = ctk.CTkEntry(base)
+        self.entry_neighbors.pack(fill="x", padx=8, pady=2)
+
+        ctk.CTkLabel(base, text="Глубина страниц (1..30):").pack(anchor="w", padx=8, pady=(8, 0))
+        self.spin_pages = ctk.CTkEntry(base)
+        self.spin_pages.pack(fill="x", padx=8, pady=2)
+
+        ctk.CTkLabel(base, text="Стоп-слова (через запятую):").pack(anchor="w", padx=8, pady=(8, 0))
+        self.entry_stop = ctk.CTkEntry(base)
+        self.entry_stop.pack(fill="x", padx=8, pady=(2, 8))
+
+        # --- чекбокс скрытия просмотренных ---
+        self.var_hide_seen = tk.BooleanVar(value=True)
+        self.chk_hide_seen = ctk.CTkCheckBox(
+            inner, text="Скрывать уже просмотренные (кроме снижения цены)",
+            variable=self.var_hide_seen,
+        )
+        self.chk_hide_seen.pack(anchor="w", padx=12, pady=4)
+
+        # --- 8 тумблеров категорий ---
+        cat_frame = ctk.CTkFrame(inner)
+        cat_frame.pack(fill="x", padx=4, pady=6)
+        ctk.CTkLabel(cat_frame, text="Категории и запросы",
+                     font=("", 14, "bold")).pack(anchor="w", padx=8, pady=(6, 4))
+
+        self.toggle_vars: dict[str, tk.BooleanVar] = {}
+        self.query_entries: dict[str, ctk.CTkEntry] = {}
+        self.price_entries: dict[str, ctk.CTkEntry] = {}
+
+        for name in CATEGORIES:
+            row = ctk.CTkFrame(cat_frame, fg_color="transparent")
+            row.pack(fill="x", padx=6, pady=3)
+
+            var = tk.BooleanVar(value=False)
+            self.toggle_vars[name] = var
+            chk = ctk.CTkSwitch(row, text=name, variable=var, onvalue=True, offvalue=False)
+            chk.pack(anchor="w")
+
+            sub = ctk.CTkFrame(row, fg_color="transparent")
+            sub.pack(fill="x", padx=6, pady=(2, 2))
+            sub.grid_columnconfigure(0, weight=1)
+
+            q_entry = ctk.CTkEntry(sub, placeholder_text=f"запрос для «{name}»")
+            q_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            self.query_entries[name] = q_entry
+
+            p_entry = ctk.CTkEntry(sub, placeholder_text="макс ₽", width=90)
+            p_entry.grid(row=0, column=1, sticky="e")
+            self.price_entries[name] = p_entry
+
+    def _build_right_panel(self) -> None:
+        # --- фильтр ---
+        filter_bar = ctk.CTkFrame(self.right, fg_color="transparent")
+        filter_bar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        filter_bar.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(filter_bar, text="Быстрый фильтр:").grid(row=0, column=0, padx=(0, 6))
+        self.entry_filter = ctk.CTkEntry(
+            filter_bar, placeholder_text="показать / -исключить  (пример: 3060 -нерабоч)"
+        )
+        self.entry_filter.grid(row=0, column=1, sticky="ew", padx=4)
+        self.entry_filter.bind("<KeyRelease>", lambda e: self.apply_live_filter())
+
+        self.combo_cat = ctk.CTkComboBox(
+            filter_bar, values=["Все категории"] + list(CATEGORIES.keys()),
+            command=lambda *_: self.apply_live_filter(),
+        )
+        self.combo_cat.set("Все категории")
+        self.combo_cat.grid(row=0, column=2, padx=4)
+
+        # --- таблица результатов ---
+        table_frame = ctk.CTkFrame(self.right)
+        table_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        cols = ("score", "value", "category", "price", "delta", "delivery",
+                "title", "reasons")
         headings = {
             "score": "Балл",
+            "value": "Выгода (₽/FPS)",
             "category": "Категория",
             "price": "Цена ₽",
+            "delta": "Динамика",
             "delivery": "Получение",
-            "avito_delivery": "Авито Доставка",
             "title": "Название",
             "reasons": "Причины оценки",
         }
         widths = {
-            "score": 60, "category": 120, "price": 85,
-            "delivery": 100, "avito_delivery": 110,
-            "title": 340, "reasons": 260,
-        }
-        for col in columns:
-            self.tree.heading(col, text=headings[col],
-                              command=lambda c=col: self._sort_by(c))
-            self.tree.column(col, width=widths[col],
-                             anchor="w" if col in ("title", "reasons") else "center")
-
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-
-        # Цветовая подсветка по баллам
-        self.tree.tag_configure("high", background=ROW_HIGH_BG, foreground=ROW_TEXT)
-        self.tree.tag_configure("mid",  background=ROW_MID_BG,  foreground=ROW_TEXT)
-        self.tree.tag_configure("low",  background=ROW_LOW_BG,  foreground=ROW_TEXT)
-
-        self.tree.bind("<Double-1>", self._on_row_double_click)
-
-    # ----------- хелперы UI -----------
-    def _make_section(self, parent, title: str) -> ctk.CTkFrame:
-        """Карточка-секция со скруглённой рамкой и заголовком."""
-        section = ctk.CTkFrame(
-            parent,
-            fg_color=COLOR_SURFACE_2,
-            corner_radius=10,
-            border_width=1,
-            border_color=COLOR_BORDER,
-        )
-        section.pack(fill="x", padx=2, pady=(0, 8))
-        ctk.CTkLabel(
-            section, text=title, font=self.font_h2,
-            text_color=COLOR_TEXT, anchor="w",
-        ).pack(fill="x", padx=10, pady=(8, 6))
-        return section
-
-    def _build_category_block(self, parent, cat: dict[str, str]) -> None:
-        block = ctk.CTkFrame(
-            parent,
-            fg_color=COLOR_SURFACE,
-            corner_radius=8,
-            border_width=1,
-            border_color=COLOR_BORDER,
-        )
-        block.pack(fill="x", padx=8, pady=4)
-
-        var = ctk.BooleanVar(value=False)
-        ctk.CTkSwitch(
-            block, text=cat["label"], variable=var,
-            font=self.font_body, text_color=COLOR_TEXT,
-            progress_color=COLOR_PRIMARY,
-        ).pack(fill="x", padx=8, pady=(6, 2))
-
-        query_entry = ctk.CTkEntry(
-            block, placeholder_text=cat["query_ph"],
-            fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER,
-            text_color=COLOR_TEXT, placeholder_text_color=COLOR_TEXT_DIM,
-        )
-        query_entry.pack(fill="x", padx=8, pady=(0, 4))
-
-        price_entry = ctk.CTkEntry(
-            block, placeholder_text="До ₽",
-            fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER,
-            text_color=COLOR_TEXT, placeholder_text_color=COLOR_TEXT_DIM,
-        )
-        price_entry.pack(fill="x", padx=8, pady=(0, 6))
-
-        self.cat_widgets[cat["key"]] = {
-            "var": var,
-            "query": query_entry,
-            "price": price_entry,
-            "url_path": cat["url_path"],
-            "label": cat["label"],
+            "score": 70, "value": 110, "category": 120, "price": 90,
+            "delta": 90, "delivery": 120, "title": 420, "reasons": 260,
         }
 
-    # ---------------------------------------------------- вкладка инструкции
-    def _build_help_tab(self) -> None:
-        self.tab_help.grid_rowconfigure(0, weight=1)
-        self.tab_help.grid_columnconfigure(0, weight=1)
-
-        scroll = ScrollableFrame(self.tab_help)
-        scroll.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        parent = scroll.inner
-
-        self._make_card(
-            parent,
-            "📝 Блок 1 — Как правильно вписывать модели комплектующих",
-            [
-                "Не нужно писать длинные названия вендоров и маркетинговые приставки — "
-                "вы потеряете объявления обычных пользователей, которые не указывают полное название.",
-                "",
-                "❌ Плохо: «Gigabyte GeForce GTX 1060 Windforce OC 6GB»",
-                "✅ Хорошо: «1060 6gb»",
-                "",
-                "❌ Плохо: «Kingston Fury Beast DDR4 3200MHz 16GB (2x8)»",
-                "✅ Хорошо: «ddr4 16gb» или «ddr4 3200»",
-                "",
-                "❌ Плохо: «ASUS ROG STRIX B450-F GAMING II»",
-                "✅ Хорошо: «b450 am4» (чипсет + сокет)",
-                "",
-                "❌ Плохо: «Блок питания Chieftec A-135 650W 80+ Bronze»",
-                "✅ Хорошо: «600w» или «chieftec 650w»",
-                "",
-                "❌ Плохо: «Noctua NH-D15 chromax.black»",
-                "✅ Хорошо: «кулер башня» или «noctua»",
-                "",
-                "❌ Плохо: «Samsung 970 EVO Plus 500GB M.2 NVMe»",
-                "✅ Хорошо: «ssd m2 512gb» или «ssd 500gb»",
-            ],
-        )
-
-        # Блок 2 — с кнопками
-        card2 = ctk.CTkFrame(
-            parent,
-            fg_color=COLOR_SURFACE_2,
-            corner_radius=10,
-            border_width=1,
-            border_color=COLOR_BORDER,
-        )
-        card2.pack(fill="x", pady=8, padx=4)
-        ctk.CTkLabel(
-            card2,
-            text="🔗 Блок 2 — Полезные ресурсы для проверки моделей и совместимости",
-            font=self.font_h2, text_color=COLOR_TEXT, anchor="w",
-        ).pack(fill="x", padx=12, pady=(10, 6))
-
-        links = [
-            ("TechPowerUp — база видеокарт (VRAM / шина / TDP)",
-             "https://www.techpowerup.com/gpu-specs/"),
-            ("TechPowerUp — база процессоров (сокеты / ядра / ОЗУ)",
-             "https://www.techpowerup.com/cpu-specs/"),
-            ("DNS Конфигуратор — проверка совместимости ПК",
-             "https://www.dns-shop.ru/configurator/"),
-        ]
-        for label, url in links:
-            row = ctk.CTkFrame(card2, fg_color="transparent")
-            row.pack(fill="x", padx=12, pady=4)
-            ctk.CTkLabel(
-                row, text=label, anchor="w",
-                font=self.font_body, text_color=COLOR_TEXT,
-            ).pack(side="left", fill="x", expand=True)
-            ctk.CTkButton(
-                row, text="Открыть", width=100,
-                font=self.font_body,
-                fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER,
-                corner_radius=6,
-                command=lambda u=url: webbrowser.open(u),
-            ).pack(side="right")
-        ctk.CTkLabel(card2, text="").pack(pady=4)
-
-        self._make_card(
-            parent,
-            "🚀 Блок 3 — Пошаговая инструкция по запуску и работе",
-            [
-                "1. Slug города. Откройте Авито в браузере, выберите город. "
-                "В адресной строке будет что-то вроде https://www.avito.ru/pervouralsk — "
-                "«pervouralsk» и есть slug. Вставьте его в поле «Город». "
-                "Если оставить пустым — поиск пойдёт по всей России (rossiya).",
-                "",
-                "2. Глубина поиска. Поле «Глубина поиска (страниц)» задаёт, сколько страниц выдачи "
-                "обходить на каждую категорию (по умолчанию 3 — это до ~150 объявлений на категорию). "
-                "На каждой странице делается 3 плавных скролла, чтобы подгрузились все 50 объявлений. "
-                "Если карточек на странице 0 — поиск по категории досрочно завершается.",
-                "",
-                "3. Первый запуск и капча. При первом поиске откроется окно браузера. "
-                "Если Авито покажет капчу — пройдите её один раз. Сессия сохранится в папке "
-                "./browser_profile, и при следующих запусках капча обычно не требуется.",
-                "",
-                "4. Стоп-слова и фразы. В поле «Стоп-слова» можно вводить как одиночные слова, "
-                "так и целые фразы (например: «работает но», «на запчасти»). "
-                "Разделяйте их запятой, точкой с запятой, символом | или с новой строки. "
-                "Регистр не важен — программа приводит всё к нижнему регистру.",
-                "",
-                "5. Фильтры надёжности. Чекбокс «Отсекать бронь и рейтинг продавца < 4.5» "
-                "строго выбрасывает объявления с бронированием или с найденным рейтингом ниже 4.5. "
-                "Чекбокс «Только продавцы с историей продаж (отзывы > 0)» (включён по умолчанию) "
-                "пропускает только продавцов, у которых есть хотя бы один отзыв.",
-                "",
-                "6. Авито Доставка. Чекбокс «Только с Авито Доставкой» (по умолчанию выключен) "
-                "оставляет только объявления с отметкой Авито Доставки. В таблице результатов "
-                "есть столбец «Авито Доставка» (да/нет), и такие объявления получают +8 к баллу.",
-                "",
-                "7. Как читать баллы надёжности (0–100) и подсветку строк:",
-                "   • зелёная строка (75–100) — надёжный продавец, есть самовывоз/тесты/пломбы;",
-                "   • жёлтая строка (50–74) — нейтрально, стоит проверить детали;",
-                "   • красная строка (0–49) — риски: бронь, низкий рейтинг, рефаб, «на запчасти».",
-                "",
-                "8. Выгрузка в Excel. Нажмите «📊 Сохранить в Excel (.xlsx)» — "
-                "будет сохранён файл с полным списком, причинами оценки, столбцом Авито Доставки "
-                "и кликабельными ссылками.",
-            ],
-        )
-
-    def _make_card(self, parent, title: str, lines: list[str]) -> None:
-        card = ctk.CTkFrame(
-            parent,
-            fg_color=COLOR_SURFACE_2,
-            corner_radius=10,
-            border_width=1,
-            border_color=COLOR_BORDER,
-        )
-        card.pack(fill="x", pady=8, padx=4)
-        ctk.CTkLabel(
-            card, text=title, anchor="w",
-            font=self.font_h2, text_color=COLOR_TEXT,
-        ).pack(fill="x", padx=12, pady=(10, 6))
-        ctk.CTkLabel(
-            card, text="\n".join(lines), anchor="w", justify="left",
-            wraplength=1000,
-            font=self.font_body, text_color=COLOR_TEXT,
-        ).pack(fill="x", padx=12, pady=(0, 12))
-
-    # ---------------------------------------------------------- обработчики
-    def _fill_default_stop_words(self) -> None:
-        self.stop_words_box.delete("1.0", "end")
-        self.stop_words_box.insert("1.0", DEFAULT_STOP_WORDS)
-
-    def _collect_config(self) -> Optional[SearchConfig]:
-        city = self.city_entry.get().strip().lower()
-        if "avito.ru/" in city:
-            city = city.split("avito.ru/", 1)[1].split("/")[0].split("?")[0]
-            self.city_entry.delete(0, "end")
-            self.city_entry.insert(0, city)
-        if any("а" <= ch <= "я" or ch == "ё" for ch in city):
-            messagebox.showwarning(
-                "Неверный формат города",
-                "В поле города нужно указать латинский slug из ссылки Авито (например: pervouralsk или ekaterinburg), а не название русскими буквами.",
-            )
-            return None
-
-        nearby_raw = self.nearby_entry.get().strip()
-        nearby = [c.strip() for c in nearby_raw.split(",") if c.strip()] if nearby_raw else []
-
-        stop_words = parse_stop_words(self.stop_words_box.get("1.0", "end"))
-
-        pages_raw = self.pages_entry.get().strip()
+        style = ttk.Style()
         try:
-            raw_p = int(pages_raw) if pages_raw else 3
-            if raw_p > 30:
-                messagebox.showinfo("Лимит страниц", "Для защиты от блокировки Авито глубина поиска ограничена 30 страницами (1500 объявлений на категорию).")
-            max_pages = min(30, max(1, raw_p))
-        except ValueError:
-            max_pages = 3
-
-        categories: list[dict[str, Any]] = []
-        for key, w in self.cat_widgets.items():
-            if not w["var"].get():
-                continue
-            query = w["query"].get().strip()
-            price_raw = w["price"].get().strip()
-            max_price = parse_price(price_raw) if price_raw else None
-            categories.append({
-                "key": key,
-                "label": w["label"],
-                "query": query,
-                "max_price": max_price,
-                "url_path": w["url_path"],
-            })
-
-        if not categories:
-            messagebox.showwarning(
-                "Нет категорий",
-                "Включите хотя бы одну категорию для поиска.",
-            )
-            return None
-
-        return SearchConfig(
-            city_slug=city,
-            nearby_cities=nearby,
-            stop_words=stop_words,
-            filter_booking_and_rating=self.filter_booking_var.get(),
-            filter_min_reviews=self.filter_min_reviews_var.get(),
-            filter_avito_delivery=self.filter_avito_delivery_var.get(),
-            max_pages=max_pages,
-            categories=categories,
-        )
-
-    def _on_start_search(self) -> None:
-        if self._worker_running:
-            return
-        cfg = self._collect_config()
-        if cfg is None:
-            return
-
-        self.results.clear()
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self.counter_label.configure(text="0 объявлений")
-        self.stop_event.clear()
-        self._set_worker_running(True)
-        self.status_label.configure(text="Запуск браузера...")
-
-        self.worker_thread = threading.Thread(
-            target=self._worker_target, args=(cfg,), daemon=True
-        )
-        self.worker_thread.start()
-
-    def _worker_target(self, cfg: SearchConfig) -> None:
-        parser = AvitoParser(cfg, self.result_queue, self.stop_event)
-        parser.run()
-
-    def _poll_queue(self) -> None:
-        try:
-            while True:
-                kind, payload = self.result_queue.get_nowait()
-                if kind == "log":
-                    self.status_label.configure(text=str(payload))
-                elif kind == "row":
-                    self._add_result(payload)
-                elif kind == "error":
-                    messagebox.showerror("Ошибка", str(payload))
-                elif kind == "done":
-                    self._set_worker_running(False)
-                    self.status_label.configure(
-                        text=f"Готово. Найдено: {len(self.results)}"
-                    )
-        except queue.Empty:
+            style.theme_use("clam")
+        except Exception:
             pass
-        self.after(200, self._poll_queue)
+        style.configure("Treeview", rowheight=24,
+                        background="#1e1e1e", fieldbackground="#1e1e1e",
+                        foreground="#e5e5e5", borderwidth=0)
+        style.configure("Treeview.Heading", background="#2b2b2b",
+                        foreground="#e5e5e5", relief="flat")
+        style.map("Treeview", background=[("selected", "#1f6feb")])
 
-    def _tag_for_score(self, score: int) -> str:
-        if score >= 75:
-            return "high"
-        if score >= 50:
-            return "mid"
-        return "low"
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings")
+        for c in cols:
+            self.tree.heading(c, text=headings[c])
+            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "title"))
+        self.tree.grid(row=0, column=0, sticky="nsew")
 
-    def _add_result(self, listing: Listing) -> None:
-        self.results.append(listing)
-        price_str = f"{listing.price:,}".replace(",", " ") if listing.price is not None else "—"
-        self.tree.insert(
-            "", "end",
-            values=(
-                listing.score,
-                listing.category,
-                price_str,
-                listing.delivery,
-                "да" if listing.has_avito_delivery else "нет",
-                listing.title,
-                "; ".join(listing.reasons),
-            ),
-            tags=(self._tag_for_score(listing.score),),
+        vsb = ctk.CTkScrollbar(table_frame, command=self.tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=vsb.set)
+
+        self.tree.tag_configure("good", foreground="#4ade80")
+        self.tree.tag_configure("warn", foreground="#facc15")
+        self.tree.tag_configure("bad", foreground="#f87171")
+        self.tree.tag_configure("drop", foreground="#38bdf8")
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+        # --- панель предпросмотра ---
+        prev = ctk.CTkFrame(self.right)
+        prev.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 6))
+        prev.grid_columnconfigure(0, weight=1)
+
+        top = ctk.CTkFrame(prev, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        top.grid_columnconfigure(0, weight=1)
+
+        self.lbl_preview_title = ctk.CTkLabel(
+            top, text="Предпросмотр объявления (клик по строке)",
+            anchor="w", font=("", 13, "bold"),
         )
-        self.counter_label.configure(text=f"{len(self.results)} объявлений")
+        self.lbl_preview_title.grid(row=0, column=0, sticky="w")
 
-    def _set_worker_running(self, running: bool) -> None:
-        self._worker_running = running
-        self.start_btn.configure(state="disabled" if running else "normal")
-        if running:
-            self.start_btn.configure(text="⏳ Поиск...")
-        else:
-            self.start_btn.configure(text="🚀 Запустить поиск")
+        self.btn_blacklist = ctk.CTkButton(
+            top, text="🚫 В ЧС продавца", width=160,
+            fg_color="#7c2d12", hover_color="#9a3412",
+            command=self.on_blacklist_seller, state="disabled",
+        )
+        self.btn_blacklist.grid(row=0, column=1, padx=4)
 
-    def _on_row_double_click(self, _event) -> None:
+        self.btn_copy = ctk.CTkButton(
+            top, text="📋 Скопировать сообщение продавцу", width=280,
+            fg_color="#334155", hover_color="#475569",
+            command=self.on_copy_message, state="disabled",
+        )
+        self.btn_copy.grid(row=0, column=2, padx=4)
+
+        self.txt_preview = ctk.CTkTextbox(prev, height=140, wrap="word")
+        self.txt_preview.grid(row=1, column=0, sticky="ew", padx=6, pady=(2, 6))
+        self.txt_preview.insert("1.0", "Здесь появится описание и предупреждения...")
+        self.txt_preview.configure(state="disabled")
+
+        # статус-бар
+        self.status = ctk.CTkLabel(self.right, text="Готов.", anchor="w")
+        self.status.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
+
+    # ---------------- работа с настройками ----------------
+    def _restore_settings_to_ui(self) -> None:
+        s = self.settings
+        self.entry_city.insert(0, s.get("city", ""))
+        self.entry_neighbors.insert(0, s.get("neighbor_cities", ""))
+        self.spin_pages.insert(0, str(s.get("pages", 3)))
+        self.entry_stop.insert(0, s.get("stop_words", ""))
+        self.var_hide_seen.set(bool(s.get("hide_seen", True)))
+
+        toggles = s.get("toggles", {})
+        for name in CATEGORIES:
+            data = toggles.get(name, {})
+            if name in self.toggle_vars:
+                self.toggle_vars[name].set(bool(data.get("enabled", False)))
+                if data.get("query"):
+                    self.query_entries[name].insert(0, data["query"])
+                mp = data.get("max_price", 0)
+                if mp:
+                    self.price_entries[name].insert(0, str(mp))
+
+    def _collect_settings(self) -> dict[str, Any]:
+        toggles: dict[str, Any] = {}
+        for name in CATEGORIES:
+            toggles[name] = {
+                "enabled": bool(self.toggle_vars[name].get()),
+                "query": self.query_entries[name].get().strip(),
+                "max_price": parse_int(self.price_entries[name].get(), 0),
+            }
+        return {
+            "city": self.entry_city.get().strip() or "moskva",
+            "neighbor_cities": self.entry_neighbors.get().strip(),
+            "pages": max(1, min(30, parse_int(self.spin_pages.get(), 3))),
+            "stop_words": self.entry_stop.get().strip(),
+            "hide_seen": bool(self.var_hide_seen.get()),
+            "only_videocards": False,
+            "channel": self.settings.get("channel", "msedge"),
+            "toggles": toggles,
+            "window_geometry": self.geometry(),
+        }
+
+    def on_close(self) -> None:
+        try:
+            self.settings = self._collect_settings()
+            save_settings(self.settings)
+        except Exception:
+            pass
+        self._stop_event.set()
+        self.db.close()
+        self.destroy()
+
+    # ---------------- парсинг (запуск/стоп) ----------------
+    def on_start(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        # Сохраняем настройки при запуске
+        self.settings = self._collect_settings()
+        save_settings(self.settings)
+
+        # Собираем списки городов
+        cities = [self.settings["city"]]
+        for c in self.settings["neighbor_cities"].split(","):
+            c = c.strip()
+            if c:
+                cities.append(c)
+
+        # Категории, у которых включён тумблер
+        active_categories: list[tuple[str, str, str, int]] = []
+        for name in CATEGORIES:
+            data = self.settings["toggles"][name]
+            if data["enabled"]:
+                active_categories.append((
+                    name,
+                    CATEGORIES[name],
+                    data["query"],
+                    data["max_price"],
+                ))
+
+        if not active_categories:
+            messagebox.showinfo("Нет категорий",
+                                "Включите хотя бы один тумблер категории.")
+            return
+
+        pages = self.settings["pages"]
+        stop_words = [w.strip() for w in self.settings["stop_words"].split(",") if w.strip()]
+
+        self._stop_event.clear()
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.tree.delete(*self.tree.get_children())
+        self.results.clear()
+        self._item_meta.clear()
+
+        def worker() -> None:
+            try:
+                self._run_parser(cities, active_categories, pages, stop_words)
+            except Exception as e:
+                self._safe_status(f"Ошибка парсинга: {e}")
+            finally:
+                self.after(0, lambda: self.btn_start.configure(state="normal"))
+                self.after(0, lambda: self.btn_stop.configure(state="disabled"))
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+
+    def _run_parser(
+        self,
+        cities: list[str],
+        active_categories: list[tuple[str, str, str, int]],
+        pages: int,
+        stop_words: list[str],
+    ) -> None:
+        channel = self.settings.get("channel", "msedge")
+        hide_seen = self.settings.get("hide_seen", True)
+
+        if sync_playwright is None:
+            raise RuntimeError("Playwright не установлен.")
+        use_channel = channel if (sys.platform == "win32" and channel) else None
+        total_pages = len(cities) * len(active_categories) * pages
+        done = 0
+        seen_ids: set[str] = set()
+
+        with sync_playwright() as pw:
+            try:
+                ctx = pw.chromium.launch_persistent_context(
+                    user_data_dir="./browser_profile",
+                    channel=use_channel,
+                    headless=False,
+                    viewport={"width": 1366, "height": 800},
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+            except Exception:
+                ctx = pw.chromium.launch_persistent_context(
+                    user_data_dir="./browser_profile",
+                    headless=False,
+                    viewport={"width": 1366, "height": 800},
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+            ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            page_obj = ctx.pages[0] if ctx.pages else ctx.new_page()
+            try:
+                self._run_loop(page_obj, cities, active_categories, pages, stop_words, hide_seen, total_pages, seen_ids)
+            finally:
+                ctx.close()
+
+    def _run_loop(
+        self,
+        page_obj: Any,
+        cities: list[str],
+        active_categories: list[tuple[str, str, str, int]],
+        pages: int,
+        stop_words: list[str],
+        hide_seen: bool,
+        total_pages: int,
+        seen_ids: set[str],
+    ) -> None:
+        done = 0
+        for city in cities:
+            for cat_name, cat_path, query, max_price in active_categories:
+                q_words = [w for w in query.split() if w]
+                last_first_id: Optional[str] = None
+                for page in range(1, pages + 1):
+                    if self._stop_event.is_set():
+                        return
+                    done += 1
+                    self._safe_status(
+                        f"[{done}/{total_pages}] {city} :: {cat_name} :: стр.{page}"
+                    )
+                    try:
+                        page_items = scrape_page(
+                            page_obj=page_obj,
+                            city=city,
+                            category_name=cat_name,
+                            category_path=cat_path,
+                            query=query,
+                            page=page,
+                            q_words=q_words,
+                            stop_words=stop_words,
+                            max_price=max_price,
+                        )
+                        page_obj.wait_for_timeout(1800)
+                    except Exception as e:
+                        self._safe_status(f"Ошибка: {e}")
+                        break
+
+                    if not page_items:
+                        break
+
+                    # Умный тормоз пагинации: повтор первого item_id
+                    first_id = page_items[0].get("item_id")
+                    if last_first_id is not None and first_id == last_first_id:
+                        break
+                    last_first_id = first_id
+
+                    new_on_page = 0
+                    for item in page_items:
+                        if self._stop_event.is_set():
+                            return
+                        iid = item["item_id"] or f"x_{time.time_ns()}"
+                        if iid in seen_ids:
+                            continue
+                        seen_ids.add(iid)
+
+                        # ЧС продавцов
+                        seller_key = item["seller"] or ""
+                        if seller_key and self.db.is_blacklisted(seller_key):
+                            continue
+
+                        # upsert истории
+                        price = item["price"]
+                        diff = self.db.upsert_item(
+                            iid, price, item["title"], seller_key
+                        )
+
+                        # Скрытие просмотренных (если не снизилась цена)
+                        if hide_seen and diff is None:
+                            row = None
+                            # upsert вернул None для повтора — попробуем понять, был ли item
+                            # (отдельный запрос — дорого, используем эвристику по new_on_page)
+                            # Для честности проверим last_price через свежий upsert невозможен.
+                            # Поэтому помечаем как скрытый, если запись уже существовала.
+                            # Простейший способ: если diff is None и item уже в results
+                            # по iid — пропустить.
+                            # Более надёжно: пометим «seen» по факту, что upsert не создал
+                            # новую запись. Мы не знаем этого из API, поэтому добавим
+                            # небольшой трюк: первый вызов upsert для нового id вернёт None
+                            # и создаст запись; повторный вызов тоже None. Различим по
+                            # глобальному множеству уже виденных за эту сессию.
+                            if iid in self._item_meta:
+                                continue
+
+                        score_name, ppf = calc_value_index(item["title"], price)
+
+                        # Записываем в results
+                        delta_text = f"🔥 -{diff} ₽" if diff else ""
+                        delivery = ""
+                        com = detect_delivery_commission(item.get("description", ""))
+                        if com:
+                            delivery = f"⚠ комиссия {com}"
+
+                        item.update({
+                            "score_name": score_name,
+                            "ppf": ppf,
+                            "delta": diff,
+                            "delta_text": delta_text,
+                            "delivery": delivery,
+                            "reasons": self._build_reasons(score_name, ppf, diff),
+                        })
+                        self.results.append(item)
+                        self._item_meta[iid] = item
+                        new_on_page += 1
+                        self.after(0, self._insert_row, item)
+
+                    if new_on_page == 0:
+                        # никаких новых объявлений — тормозим пагинацию
+                        break
+
+        self._safe_status(f"Готово. Найдено: {len(self.results)}")
+
+    def _build_reasons(self, score_name: str, ppf: int, diff: Optional[int]) -> str:
+        reasons = []
+        if score_name:
+            reasons.append(f"GPU={score_name}")
+        if ppf:
+            if ppf <= 150:
+                reasons.append("выгодно")
+            elif ppf <= 250:
+                reasons.append("средне")
+            else:
+                reasons.append("дорого")
+        if diff:
+            reasons.append(f"снижение {diff} ₽")
+        return ", ".join(reasons)
+
+    def _safe_status(self, text: str) -> None:
+        self.after(0, lambda: self.status.configure(text=text))
+
+    def on_stop(self) -> None:
+        self._stop_event.set()
+        self._safe_status("Остановка...")
+
+    # ---------------- вставка/фильтрация строк ----------------
+    def _insert_row(self, item: dict[str, Any]) -> None:
+        iid = item["item_id"] or f"x_{time.time_ns()}"
+        tag = "good" if item.get("ppf") and item["ppf"] <= 150 else (
+            "warn" if item.get("ppf") and item["ppf"] <= 250 else ""
+        )
+        if item.get("delta"):
+            tag = "drop"
+        self.tree.insert(
+            "", "end", iid=iid,
+            values=(
+                item.get("score_name", ""),
+                item.get("ppf", ""),
+                item.get("category", ""),
+                item.get("price", ""),
+                item.get("delta_text", ""),
+                item.get("delivery", ""),
+                item.get("title", ""),
+                item.get("reasons", ""),
+            ),
+            tags=(tag,) if tag else (),
+        )
+
+    def apply_live_filter(self) -> None:
+        raw = self.entry_filter.get().strip()
+        cat = self.combo_cat.get()
+        include = [w.lower() for w in raw.split() if w and not w.startswith("-")]
+        exclude = [w.lower()[1:] for w in raw.split() if w.startswith("-") and len(w) > 1]
+
+        self.tree.delete(*self.tree.get_children())
+        for item in self.results:
+            title_low = item.get("title", "").lower()
+            if cat and cat != "Все категории" and item.get("category") != cat:
+                continue
+            if include and not all(w in title_low for w in include):
+                continue
+            if exclude and any(w in title_low for w in exclude):
+                continue
+            self._insert_row(item)
+
+    # ---------------- клики по таблице ----------------
+    def on_tree_select(self, event: Any) -> None:
         sel = self.tree.selection()
         if not sel:
             return
-        idx = self.tree.index(sel[0])
-        if 0 <= idx < len(self.results):
-            webbrowser.open(self.results[idx].url)
-
-    def _sort_by(self, col: str) -> None:
-        reverse = not self._sort_reverse.get(col, False)
-        self._sort_reverse[col] = reverse
-
-        def key_func(i: int) -> Any:
-            r = self.results[i]
-            return {
-                "score": r.score,
-                "category": r.category.lower(),
-                "price": r.price if r.price is not None else 10**12,
-                "delivery": r.delivery.lower(),
-                "avito_delivery": 1 if r.has_avito_delivery else 0,
-                "title": r.title.lower(),
-                "reasons": ";".join(r.reasons).lower(),
-            }[col]
-
-        indexed = list(enumerate(self.results))
-        indexed.sort(key=lambda t: key_func(t[0]), reverse=reverse)
-
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self.results = [r for _, r in indexed]
-        for r in self.results:
-            price_str = f"{r.price:,}".replace(",", " ") if r.price is not None else "—"
-            self.tree.insert(
-                "", "end",
-                values=(r.score, r.category, price_str, r.delivery,
-                        "да" if r.has_avito_delivery else "нет",
-                        r.title, "; ".join(r.reasons)),
-                tags=(self._tag_for_score(r.score),),
-            )
-
-    def _on_save_excel(self) -> None:
-        if not self.results:
-            messagebox.showinfo("Нет данных", "Сначала выполните поиск.")
+        iid = sel[0]
+        item = self._item_meta.get(iid)
+        if not item:
             return
-        default_name = f"avito_hunter_{datetime.now():%Y-%m-%d_%H-%M}.xlsx"
-        path = filedialog.asksaveasfilename(
-            title="Сохранить результаты",
-            defaultextension=".xlsx",
-            initialfile=default_name,
-            filetypes=[("Excel", "*.xlsx")],
+        self.selected_item = item
+        self.btn_blacklist.configure(
+            state="normal" if item.get("seller") else "disabled"
         )
-        if not path:
+        self.btn_copy.configure(state="normal")
+
+        text = f"{item.get('title','')}\n"
+        text += f"Цена: {item.get('price',0)} ₽ | Продавец: {item.get('seller','—')}\n"
+        text += f"Ссылка: {item.get('url','')}\n"
+        text += "-" * 60 + "\n"
+        com = detect_delivery_commission(item.get("description", ""))
+        if com:
+            text += f"⚠ ВНИМАНИЕ: упоминается комиссия Авито Доставки ({com})\n"
+        text += (item.get("description") or "Описание не загружено.")
+
+        self.txt_preview.configure(state="normal")
+        self.txt_preview.delete("1.0", "end")
+        self.txt_preview.insert("1.0", text)
+        self.txt_preview.configure(state="disabled")
+
+    def on_tree_double_click(self, event: Any) -> None:
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        item = self._item_meta.get(iid)
+        if item and item.get("url"):
+            webbrowser.open(item["url"])
+
+    # ---------------- ЧС и буфер обмена ----------------
+    def on_blacklist_seller(self) -> None:
+        item = self.selected_item
+        if not item:
+            return
+        seller = item.get("seller") or ""
+        if not seller:
+            messagebox.showwarning("Нет продавца", "У объявления нет имени продавца.")
+            return
+        self.db.blacklist_seller(seller, "manual")
+        # Убираем все лоты этого продавца из таблицы и списка
+        self.results = [r for r in self.results if r.get("seller") != seller]
+        for iid, meta in list(self._item_meta.items()):
+            if meta.get("seller") == seller:
+                try:
+                    self.tree.delete(iid)
+                except Exception:
+                    pass
+                self._item_meta.pop(iid, None)
+        self.status.configure(text=f"Продавец «{seller}» добавлен в ЧС.")
+
+    def on_copy_message(self) -> None:
+        item = self.selected_item
+        if not item:
+            return
+        msg = (
+            "Здравствуйте! Интересует ваше объявление. "
+            "Перед оформлением заказа, пожалуйста, пришлите:\n"
+            "1) фото/видео запуска FurMark (15 минут, с температурой);\n"
+            "2) скриншот GPU-Z (вкладки Graphics Card и Sensors);\n"
+            "3) подтверждение, что карта не майнилась и не ремонтировалась.\n"
+            "Спасибо!"
+        )
+        self.clipboard_clear()
+        self.clipboard_append(msg)
+        self.status.configure(text="Сообщение продавцу скопировано в буфер обмена.")
+
+    # ---------------- Excel ----------------
+    def on_save_excel(self) -> None:
+        if not self.results:
+            messagebox.showinfo("Пусто", "Нет данных для сохранения.")
             return
         try:
-            export_to_excel(self.results, path)
-            messagebox.showinfo("Готово", f"Файл сохранён:\n{path}")
-            if sys.platform == "win32":
-                try:
-                    os.startfile(path)  # type: ignore[attr-defined]
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Ошибка сохранения", str(exc))
+            from openpyxl import Workbook
+        except ImportError:
+            messagebox.showerror("Нет openpyxl", "Установите: pip install openpyxl")
+            return
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "results"
+        headers = ["Балл", "₽/FPS", "Категория", "Цена", "Динамика",
+                   "Получение", "Название", "Причины", "Ссылка", "Продавец"]
+        ws.append(headers)
+        for r in self.results:
+            ws.append([
+                r.get("score_name", ""),
+                r.get("ppf", ""),
+                r.get("category", ""),
+                r.get("price", ""),
+                r.get("delta_text", ""),
+                r.get("delivery", ""),
+                r.get("title", ""),
+                r.get("reasons", ""),
+                r.get("url", ""),
+                r.get("seller", ""),
+            ])
+        path = f"avito_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        try:
+            wb.save(path)
+            self.status.configure(text=f"Сохранено: {path}")
+        except Exception as e:
+            messagebox.showerror("Ошибка сохранения", str(e))
 
 
-# =============================================================================
-#  ENTRYPOINT
-# =============================================================================
-
+# ---------------------------------------------------------------------------
+# Запуск
+# ---------------------------------------------------------------------------
 def main() -> None:
     app = AvitoHunterApp()
     app.mainloop()
