@@ -52,8 +52,8 @@ try:
 except ImportError:
     # Мягкий фоллбэк, чтобы GUI запускался даже без gpu_bench.py
     GPU_BENCHMARKS = {}
-    def calc_value_index(title: str, price: int) -> tuple[str, int]:
-        return "", 0
+    def calc_value_index(title: str, description: str, price: int) -> tuple[str, int, str, int]:
+        return "", 0, "", 0
 
 # --- Playwright для парсинга ---
 try:
@@ -65,7 +65,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-APP_TITLE = "Avito Hardware Hunter v2.2.0"
+APP_TITLE = "Avito Hardware Hunter v2.3.0"
 SETTINGS_FILE = os.path.join(_app_dir(), "settings.json")
 DB_FILE = os.path.join(_app_dir(), "hunter_history.db")
 BROWSER_PROFILE_DIR = os.path.join(_app_dir(), "browser_profile")
@@ -85,17 +85,23 @@ CATEGORIES: dict[str, str] = {
 }
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "city": "moskva",
+    "city": "rossiya",
     "neighbor_cities": "",
     "pages": 3,
     "stop_words": "нерабоч",            # стоп-слова через запятую
     "hide_seen": True,                   # скрывать уже просмотренные
+    "hide_reserved": True,               # скрывать зарезервированные
+    "only_delivery": False,              # только с Авито Доставкой
+    "exclude_kaliningrad": False,        # исключить Калининградскую область
+    "min_rating": 0.0,                   # мин. рейтинг продавца
+    "min_reviews": 0,                    # мин. отзывов продавца
     "only_videocards": False,            # legacy-флаг (совместимость)
     "channel": "msedge",                 # браузерный канал
     "toggles": {
         name: {
             "enabled": (name == "Видеокарты"),
             "query": "",
+            "min_price": 0,
             "max_price": 0,
         }
         for name in CATEGORIES
@@ -124,10 +130,17 @@ def load_settings() -> dict[str, Any]:
                 data = json.load(f)
             merged = json.loads(json.dumps(DEFAULT_SETTINGS))
             merged.update(data)
-            # Гарантируем наличие всех 8 тумблеров
+            # Гарантируем наличие всех 8 тумблеров и новых полей
+            merged.setdefault("hide_reserved", True)
+            merged.setdefault("only_delivery", False)
+            merged.setdefault("exclude_kaliningrad", False)
+            merged.setdefault("min_rating", 0.0)
+            merged.setdefault("min_reviews", 0)
             tg = merged.setdefault("toggles", {})
             for name in CATEGORIES:
-                tg.setdefault(name, {"enabled": False, "query": "", "max_price": 0})
+                data = tg.setdefault(name, {"enabled": False, "query": "", "min_price": 0, "max_price": 0})
+                data.setdefault("min_price", 0)
+                data.setdefault("max_price", 0)
             return merged
         except Exception:
             pass
@@ -364,12 +377,76 @@ def contains_stop_words(text: str, stop_words: list[str]) -> bool:
     return any(w and w.lower() in low for w in stop_words)
 
 
+def _query_tokens(query: str) -> list[str]:
+    """Токены поискового запроса с учётом границ слов."""
+    return [t.lower() for t in re.findall(r"[a-zа-яё0-9]+", query) if t]
+
+
+def _has_all_query_tokens(query: str, full_text: str) -> bool:
+    """Проверяет, что ВСЕ токены запроса встречаются в тексте с границами."""
+    tokens = _query_tokens(query)
+    if not tokens:
+        return True
+    low = full_text.lower()
+    for tok in tokens:
+        pattern = rf"(?<![a-zа-яё0-9]){re.escape(tok)}(?![a-zа-яё0-9])"
+        if not re.search(pattern, low):
+            return False
+    return True
+
+
 def detect_delivery_commission(desc: str) -> Optional[str]:
     low = (desc or "").lower()
     for marker in ("комиссия", "+7%", "+9%"):
         if marker.lower() in low:
             return marker
     return None
+
+
+# --- константы фильтров ---
+_KALININGRAD_WORDS = [
+    "калининград", "светлогорск", "зеленоградск", "балтийск",
+    "гурьевск", "черняховск", "советск", "гусев", "пионерский",
+]
+
+
+def _extract_seller_rating(card: Any) -> tuple[float, int]:
+    """Извлекает (rating, reviews_count) из карточки выдачи."""
+    rating = 0.0
+    reviews = 0
+    try:
+        rating_el = card.query_selector('[data-marker="seller-rating/score"]')
+        if rating_el:
+            rating_text = rating_el.inner_text().strip().replace(",", ".")
+            rating = float(rating_text)
+    except Exception:
+        pass
+    try:
+        summary_el = card.query_selector('[data-marker="seller-rating/summary"]')
+        if summary_el:
+            summary_text = summary_el.inner_text().strip()
+            m = re.search(r"\d+", summary_text)
+            if m:
+                reviews = int(m.group(0))
+    except Exception:
+        pass
+    return rating, reviews
+
+
+def _transliterate_slug(text: str) -> str:
+    """Преобразует русское название города в латинский slug Авито."""
+    translit_map = {
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+        "ё": "e", "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k",
+        "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+        "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts",
+        "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "",
+        "э": "e", "ю": "yu", "я": "ya",
+    }
+    text = text.lower().strip()
+    slug = "".join(translit_map.get(ch, ch) for ch in text)
+    slug = re.sub(r"[^a-z0-9]+", "_", slug).strip("_")
+    return slug
 
 
 def scrape_page(
@@ -383,9 +460,14 @@ def scrape_page(
     stop_words: list[str],
     min_price: int,
     max_price: int,
+    hide_reserved: bool = True,
+    only_delivery: bool = False,
+    exclude_kaliningrad: bool = False,
+    min_rating: float = 0.0,
+    min_reviews: int = 0,
 ) -> list[dict[str, Any]]:
     """Возвращает список карточек с одной страницы, используя единую вкладку."""
-    url = build_search_url(city, category_path, query, page)
+    url = build_search_url(city, category_path, query, page, min_price, max_price)
     results: list[dict[str, Any]] = []
     try:
         page_obj.goto(url, timeout=45000, wait_until="domcontentloaded")
@@ -423,29 +505,35 @@ def scrape_page(
             seller = seller_el.inner_text().strip() if seller_el else ""
 
             # фильтр по ключевым словам
-            if q_words and not any(w.lower() in title.lower() for w in q_words):
+            full_text = f"{title} "
+            card_text = ""
+            try:
+                card_text = card.inner_text()
+            except Exception:
+                pass
+            full_text += card_text
+
+            if q_words and not _has_all_query_tokens(query, full_text):
                 continue
-            if stop_words and contains_stop_words(title, stop_words):
+            if stop_words and contains_stop_words(full_text, stop_words):
                 continue
             if min_price > 0 and price < min_price:
                 continue
             if max_price > 0 and price > max_price:
                 continue
 
-            card_text = ""
-            try:
-                card_text = card.inner_text()
-            except Exception:
-                pass
             # --- зарезервированные лоты ---
-            reserved_marker = card.query_selector('[data-marker*="reserved"], [class*="reserved"]')
-            if reserved_marker is not None or any(
-                word in card_text.lower()
-                for word in ("зарезервирован", "забронирован")
-            ):
-                continue
+            if hide_reserved:
+                reserved_marker = card.query_selector('[data-marker*="reserved"], [class*="reserved"]')
+                if reserved_marker is not None or any(
+                    word in card_text.lower()
+                    for word in ("зарезервирован", "забронирован")
+                ):
+                    continue
 
             has_delivery = bool(card.query_selector('[data-marker="delivery/icon"], [class*="delivery"]')) or ("доставка" in card_text.lower())
+            if only_delivery and not has_delivery:
+                continue
 
             description = ""
             try:
@@ -457,12 +545,27 @@ def scrape_page(
             except Exception:
                 pass
 
+            # --- локация ---
             location_el = card.query_selector('[data-marker="item-address"]')
-            location = (
-                location_el.inner_text().strip().split(",")[0].strip()
-                if location_el
-                else city
-            )
+            if location_el:
+                location = location_el.inner_text().strip().split(",")[0].strip()
+            else:
+                location = ""
+            readable_city = "Россия / не указан" if city == "rossiya" else city
+            location = location or readable_city
+
+            # --- Калининград ---
+            if exclude_kaliningrad:
+                loc_low = location.lower()
+                if any(w in loc_low for w in _KALININGRAD_WORDS):
+                    continue
+
+            # --- рейтинг и отзывы продавца ---
+            seller_rating, seller_reviews = _extract_seller_rating(card)
+            if min_rating > 0 and seller_rating < min_rating:
+                continue
+            if min_reviews > 0 and seller_reviews < min_reviews:
+                continue
 
             results.append({
                 "item_id": item_id,
@@ -474,6 +577,8 @@ def scrape_page(
                 "location": location,
                 "description": description,
                 "has_delivery": has_delivery,
+                "seller_rating": seller_rating,
+                "seller_reviews": seller_reviews,
             })
         except Exception:
             continue
@@ -587,13 +692,44 @@ class AvitoHunterApp(ctk.CTk):
         self.entry_stop = ctk.CTkTextbox(base, height=76, wrap="word")
         self.entry_stop.pack(fill="x", padx=8, pady=(2, 8))
 
-        # --- чекбокс скрытия просмотренных ---
+        # --- блок фильтров и тумблеров ---
+        filters_frame = ctk.CTkFrame(inner)
+        filters_frame.pack(fill="x", padx=4, pady=6)
+        ctk.CTkLabel(filters_frame, text="Фильтры и тумблеры",
+                     font=("", 14, "bold")).pack(anchor="w", padx=8, pady=(6, 4))
+
         self.var_hide_seen = tk.BooleanVar(value=True)
-        self.chk_hide_seen = ctk.CTkCheckBox(
-            inner, text="Скрывать уже просмотренные (кроме снижения цены)",
+        self.var_hide_reserved = tk.BooleanVar(value=True)
+        self.var_only_delivery = tk.BooleanVar(value=False)
+        self.var_exclude_kaliningrad = tk.BooleanVar(value=False)
+
+        ctk.CTkCheckBox(
+            filters_frame, text="Скрывать уже просмотренные (кроме снижения цены)",
             variable=self.var_hide_seen,
-        )
-        self.chk_hide_seen.pack(anchor="w", padx=12, pady=4)
+        ).pack(anchor="w", padx=8, pady=2)
+        ctk.CTkCheckBox(
+            filters_frame, text="Скрывать зарезервированные товары",
+            variable=self.var_hide_reserved,
+        ).pack(anchor="w", padx=8, pady=2)
+        ctk.CTkCheckBox(
+            filters_frame, text="Только с Авито Доставкой",
+            variable=self.var_only_delivery,
+        ).pack(anchor="w", padx=8, pady=2)
+        ctk.CTkCheckBox(
+            filters_frame, text="Исключить Калининградскую область",
+            variable=self.var_exclude_kaliningrad,
+        ).pack(anchor="w", padx=8, pady=2)
+
+        # --- настройки продавца ---
+        seller_frame = ctk.CTkFrame(inner)
+        seller_frame.pack(fill="x", padx=4, pady=6)
+        ctk.CTkLabel(seller_frame, text="Продавец",
+                     font=("", 14, "bold")).pack(anchor="w", padx=8, pady=(6, 4))
+
+        self.entry_min_rating = ctk.CTkEntry(seller_frame, placeholder_text="Мин. рейтинг (0..5.0)")
+        self.entry_min_rating.pack(fill="x", padx=8, pady=2)
+        self.entry_min_reviews = ctk.CTkEntry(seller_frame, placeholder_text="Мин. отзывов")
+        self.entry_min_reviews.pack(fill="x", padx=8, pady=(2, 8))
 
         # --- 8 тумблеров категорий ---
         cat_frame = ctk.CTkFrame(inner)
@@ -658,9 +794,9 @@ class AvitoHunterApp(ctk.CTk):
         table_frame.grid_columnconfigure(0, weight=1)
 
         cols = ("score", "ppf", "category", "price", "delta", "delivery",
-                "location", "title", "reasons")
+                "location", "title", "verdict")
         headings = {
-            "score": "Балл",
+            "score": "GPU (балл)",
             "ppf": "Выгода (₽/FPS)",
             "category": "Категория",
             "price": "Цена ₽",
@@ -668,11 +804,11 @@ class AvitoHunterApp(ctk.CTk):
             "delivery": "Получение",
             "location": "Город",
             "title": "Название",
-            "reasons": "Причины оценки",
+            "verdict": "Вердикт",
         }
         widths = {
-            "score": 70, "ppf": 110, "category": 120, "price": 90,
-            "delta": 90, "delivery": 120, "location": 110, "title": 310, "reasons": 260,
+            "score": 110, "ppf": 110, "category": 120, "price": 90,
+            "delta": 90, "delivery": 120, "location": 110, "title": 310, "verdict": 260,
         }
 
         style = ttk.Style()
@@ -759,6 +895,16 @@ class AvitoHunterApp(ctk.CTk):
         self.entry_stop.delete("1.0", "end")
         self.entry_stop.insert("1.0", s.get("stop_words", ""))
         self.var_hide_seen.set(bool(s.get("hide_seen", True)))
+        self.var_hide_reserved.set(bool(s.get("hide_reserved", True)))
+        self.var_only_delivery.set(bool(s.get("only_delivery", False)))
+        self.var_exclude_kaliningrad.set(bool(s.get("exclude_kaliningrad", False)))
+
+        mr = s.get("min_rating", 0.0)
+        if mr:
+            self.entry_min_rating.insert(0, str(mr))
+        mrv = s.get("min_reviews", 0)
+        if mrv:
+            self.entry_min_reviews.insert(0, str(mrv))
 
         toggles = s.get("toggles", {})
         for name in CATEGORIES:
@@ -784,11 +930,16 @@ class AvitoHunterApp(ctk.CTk):
                 "max_price": parse_int(self.price_entries[name].get(), 0),
             }
         return {
-            "city": self.entry_city.get().strip() or "moskva",
+            "city": self.entry_city.get().strip() or "rossiya",
             "neighbor_cities": self.entry_neighbors.get().strip(),
             "pages": max(1, min(30, parse_int(self.spin_pages.get(), 3))),
             "stop_words": self.entry_stop.get("1.0", "end").strip(),
             "hide_seen": bool(self.var_hide_seen.get()),
+            "hide_reserved": bool(self.var_hide_reserved.get()),
+            "only_delivery": bool(self.var_only_delivery.get()),
+            "exclude_kaliningrad": bool(self.var_exclude_kaliningrad.get()),
+            "min_rating": self.entry_min_rating.get().strip(),
+            "min_reviews": self.entry_min_reviews.get().strip(),
             "only_videocards": False,
             "channel": self.settings.get("channel", "msedge"),
             "toggles": toggles,
@@ -901,6 +1052,27 @@ class AvitoHunterApp(ctk.CTk):
             finally:
                 ctx.close()
 
+    def _apply_price_filters_on_site(
+        self, page_obj: Any, min_price: int, max_price: int
+    ) -> None:
+        """Выставляет фильтр цены прямо на сайте Авито (первая страница)."""
+        try:
+            if min_price > 0:
+                pfrom = page_obj.query_selector('[data-marker="price-from/input"]')
+                if pfrom:
+                    pfrom.fill(str(min_price))
+            if max_price > 0:
+                pto = page_obj.query_selector('[data-marker="price-to/input"]')
+                if pto:
+                    pto.fill(str(max_price))
+            if min_price > 0 or max_price > 0:
+                submit = page_obj.query_selector('[data-marker="search-filters/submit-button"]')
+                if submit:
+                    submit.click()
+                    page_obj.wait_for_timeout(1500)
+        except Exception as e:
+            print(f"[price filter] не удалось применить фильтр на сайте: {e}")
+
     def _run_loop(
         self,
         page_obj: Any,
@@ -912,6 +1084,13 @@ class AvitoHunterApp(ctk.CTk):
         total_pages: int,
         seen_ids: set[str],
     ) -> None:
+        # фильтры из настроек
+        hide_reserved = self.settings.get("hide_reserved", True)
+        only_delivery = self.settings.get("only_delivery", False)
+        exclude_kaliningrad = self.settings.get("exclude_kaliningrad", False)
+        min_rating = float(self.settings.get("min_rating") or 0.0)
+        min_reviews = int(self.settings.get("min_reviews") or 0)
+
         done = 0
         for city in cities:
             for cat_name, cat_path, query, min_price, max_price in active_categories:
@@ -924,6 +1103,10 @@ class AvitoHunterApp(ctk.CTk):
                     self._safe_status(
                         f"[{done}/{total_pages}] {city} :: {cat_name} :: стр.{page}"
                     )
+
+                    if page == 1 and (min_price > 0 or max_price > 0):
+                        self._apply_price_filters_on_site(page_obj, min_price, max_price)
+
                     try:
                         page_items = scrape_page(
                             page_obj=page_obj,
@@ -936,6 +1119,11 @@ class AvitoHunterApp(ctk.CTk):
                             stop_words=stop_words,
                             min_price=min_price,
                             max_price=max_price,
+                            hide_reserved=hide_reserved,
+                            only_delivery=only_delivery,
+                            exclude_kaliningrad=exclude_kaliningrad,
+                            min_rating=min_rating,
+                            min_reviews=min_reviews,
                         )
                         page_obj.wait_for_timeout(1800)
                     except Exception as e:
@@ -976,7 +1164,15 @@ class AvitoHunterApp(ctk.CTk):
                         if hide_seen and not is_new and diff is None:
                             continue
 
-                        score_name, ppf = calc_value_index(item["title"], price)
+                        gpu_label, ppf, gpu_key, gpu_score = calc_value_index(
+                            item["title"], item.get("description", ""), price
+                        )
+
+                        # GPU (балл)
+                        if gpu_key:
+                            score_name = f"{gpu_key.upper()} ({gpu_score})"
+                        else:
+                            score_name = ""
 
                         # Записываем в results
                         delta_text = f"🔥 -{diff} ₽" if diff else ""
@@ -985,13 +1181,16 @@ class AvitoHunterApp(ctk.CTk):
                         if com:
                             delivery += f" (⚠ +{com})"
 
+                        verdict = self._build_verdict(item, ppf, diff)
+
                         item.update({
                             "score_name": score_name,
+                            "gpu_label": gpu_label,
                             "ppf": ppf,
                             "delta": diff,
                             "delta_text": delta_text,
                             "delivery": delivery,
-                            "reasons": self._build_reasons(score_name, ppf, diff),
+                            "verdict": verdict,
                         })
                         self.results.append(item)
                         self._item_meta[iid] = item
@@ -1004,20 +1203,33 @@ class AvitoHunterApp(ctk.CTk):
 
         self._safe_status(f"Готово. Найдено: {len(self.results)}")
 
-    def _build_reasons(self, score_name: str, ppf: int, diff: Optional[int]) -> str:
-        reasons = []
-        if score_name:
-            reasons.append(f"GPU={score_name}")
-        if ppf:
-            if ppf <= 150:
-                reasons.append("выгодно")
-            elif ppf <= 250:
-                reasons.append("средне")
+    def _build_verdict(self, item: dict[str, Any], ppf: int, diff: Optional[int]) -> str:
+        labels: list[str] = []
+
+        if ppf > 0:
+            if ppf <= 110:
+                labels.append("🔥 Топ за свои деньги")
+            elif ppf <= 150:
+                labels.append(" Выгодная цена")
+            elif ppf <= 230:
+                labels.append("⚖️ Рыночная цена")
             else:
-                reasons.append("дорого")
+                labels.append("⚠️ Дорого")
+
+        text = (item.get("title", "") + " " + item.get("description", "")).lower()
+        if any(w in text for w in ("пломб", "чек", "гарант")):
+            labels.append(" Пломба/чек")
+        if any(w in text for w in ("коробк", "комплект")):
+            labels.append("📦 Комплект")
+        if "торг" in text:
+            labels.append("🤝 Торг")
         if diff:
-            reasons.append(f"снижение {diff} ₽")
-        return ", ".join(reasons)
+            labels.append(f"📉 Скидка -{diff} ₽")
+
+        if not labels:
+            labels.append("🔎 Обычный лот")
+
+        return " • ".join(labels)
 
     def _safe_status(self, text: str) -> None:
         self.after(0, lambda: self.status.configure(text=text))
@@ -1083,14 +1295,14 @@ class AvitoHunterApp(ctk.CTk):
             "", "end", iid=iid,
             values=(
                 item.get("score_name", ""),
-                item.get("ppf", ""),
+                item.get("ppf", "") if item.get("ppf", 0) > 0 else "—",
                 item.get("category", ""),
                 item.get("price", ""),
                 item.get("delta_text", ""),
                 item.get("delivery", ""),
                 item.get("location", ""),
                 item.get("title", ""),
-                item.get("reasons", ""),
+                item.get("verdict", ""),
             ),
             tags=(tag,) if tag else (),
         )
@@ -1119,14 +1331,16 @@ class AvitoHunterApp(ctk.CTk):
         items: list[tuple[Any, str]] = []
         for iid in self.tree.get_children():
             val = self.tree.set(iid, col)
-            if col in ("price", "ppf"):
-                sort_val: Any = parse_int(val, 0)
+            if col == "price":
+                sort_val: Any = int(re.sub(r"\D", "", str(val)) or 0)
+            elif col == "ppf":
+                sort_val = parse_int(val, 0)
             else:
                 sort_val = str(val).lower()
             items.append((sort_val, iid))
 
         if col == "ppf":
-            # пустые / нулевые ppf принудительно в конец, вне зависимости от reverse
+            # пустые / нулевые ppf ("—" или "0") принудительно в конец
             non_empty = [(v, iid) for v, iid in items if v != 0 and v != ""]
             empty = [(v, iid) for v, iid in items if v == 0 or v == ""]
             non_empty.sort(key=lambda x: x[0], reverse=reverse)
@@ -1284,8 +1498,8 @@ class AvitoHunterApp(ctk.CTk):
         wb = Workbook()
         ws = wb.active
         ws.title = "results"
-        headers = ["Балл", "₽/FPS", "Категория", "Цена", "Динамика",
-                   "Получение", "Город", "Название", "Причины", "Ссылка", "Продавец"]
+        headers = ["GPU (балл)", "₽/FPS", "Категория", "Цена", "Динамика",
+                   "Получение", "Город", "Название", "Вердикт", "Ссылка", "Продавец"]
         ws.append(headers)
         for r in self.results:
             ws.append([

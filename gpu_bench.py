@@ -1,5 +1,4 @@
-"""
-gpu_bench.py — локальный словарь производительности видеокарт и калькулятор
+"""gpu_bench.py — локальный словарь производительности видеокарт и калькулятор
 value-index (₽ за 1 балл FPS). 100 баллов = GTX 1060 6GB.
 
 Никаких внешних API. Чистый Python + регулярки.
@@ -8,7 +7,7 @@ value-index (₽ за 1 балл FPS). 100 баллов = GTX 1060 6GB.
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # База производительности (усреднённые FPS-индексы в игровых сценариях 1080p)
@@ -17,12 +16,15 @@ from typing import Optional
 GPU_BENCHMARKS: dict[str, int] = {
     # --- low / legacy ---
     "gtx 750 ti": 45,
-    "gtx 1050": 55,
-    "gtx 1050 ti": 65,
+    "gtx 950": 58,
     "gtx 960": 60,
     "gtx 970": 85,
     "gtx 980": 100,
     "gtx 980 ti": 130,
+    "gtx 1050": 55,
+    "gtx 1050 ti": 65,
+    "rx 470": 72,
+    "rx 480": 85,
     "rx 550": 35,
     "rx 560": 45,
     "rx 570": 78,
@@ -122,9 +124,16 @@ _BRAND_RE = re.compile(
 
 
 def _normalize(text: str) -> str:
-    """Приводим к нижнему регистру, убираем лишние разделители."""
+    """Приводим к нижнему регистру, убираем лишние разделители,
+    заменяем кириллические написания GPU на латинские."""
     text = text.lower()
     text = text.replace("ё", "е")
+    # Кириллические написания брендов
+    text = text.replace("рх", "rx")
+    text = text.replace("гтх", "gtx")
+    text = text.replace("ртх", "rtx")
+    text = text.replace("радеон", "radeon")
+    text = text.replace("джифорс", "geforce")
     # Унификация сокращений, которые любят писать на Авито
     text = re.sub(r"\b(\d{4})\s*s\b", r"\1 super", text)   # 1660s -> 1660 super
     text = re.sub(r"\b(\d{4})\s*ti\b", r"\1 ti", text)
@@ -181,20 +190,24 @@ def _detect_series(text: str) -> Optional[str]:
     return f"rx {series}"
 
 
-def calc_value_index(title: str, price: int) -> tuple[str, int]:
+def calc_value_index(
+    title: str, description: str, price: int
+) -> tuple[str, int, str, int]:
     """
-    По заголовку распознаёт GPU и считает цену за 1 балл FPS.
+    По заголовку (и описанию) распознаёт GPU и считает цену за 1 балл FPS.
 
-    Возвращает (название_эталона, цена_за_1_балл_FPS) либо ("", 0),
-    если модель не распознана или цена некорректна.
+    Возвращает tuple:
+        (название_эталона, цена_за_1_балл_FPS, ключ_модели, raw_score)
+    Если модель не распознана — ключ_модели пуст, raw_score = 0.
     """
     if not title or price is None or price <= 0:
-        return "", 0
+        return "", 0, "", 0
 
-    low = _normalize(title)
+    combined = f"{title} {description or ''}"
+    low = _normalize(combined)
     series = _detect_series(low)
     if not series:
-        return "", 0
+        return "", 0, "", 0
 
     # Уточнение по VRAM для 1060 и 580 (частые ловушки на Авито)
     vram_m = _VRAM_RE.search(low)
@@ -222,18 +235,18 @@ def calc_value_index(title: str, price: int) -> tuple[str, int]:
         if key in GPU_BENCHMARKS:
             score = GPU_BENCHMARKS[key]
             if score <= 0:
-                return "", 0
+                return "", 0, "", 0
             price_per_fps = round(price / score)
-            return key.upper(), price_per_fps
+            return key.upper(), price_per_fps, key, score
 
     # Фоллбэк: пробуем найти хотя бы подстроку в словаре
     for key, score in GPU_BENCHMARKS.items():
         if key in series or series in key:
             if score <= 0:
                 continue
-            return key.upper(), round(price / score)
+            return key.upper(), round(price / score), key, score
 
-    return "", 0
+    return "", 0, "", 0
 
 
 # ---------------------------------------------------------------------------
