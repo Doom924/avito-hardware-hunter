@@ -65,8 +65,8 @@ CATEGORIES: dict[str, str] = {
     "Процессоры": "/tovary_dlya_kompyutera/komplektuyuschie/protsessory",
     "Материнские платы": "/tovary_dlya_kompyutera/komplektuyuschie/materinskie_platy",
     "Блоки питания": "/tovary_dlya_kompyutera/komplektuyuschie/bloki_pitaniya",
-    "Охлаждение": "/tovary_dlya_kompyutera/komplektuyuschie/ohlazhdenie",
-    "SSD": "/tovary_dlya_kompyutera/komplektuyuschie/ssd",
+    "Охлаждение": "/tovary_dlya_kompyutera/komplektuyuschie/sistemy_ohlazhdeniya",
+    "SSD": "/tovary_dlya_kompyutera/komplektuyuschie/zhestkie_diski",
 }
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -285,6 +285,7 @@ class SmoothScrollFrame(ctk.CTkFrame):
 # Парсер Авито (Playwright)
 # ---------------------------------------------------------------------------
 def build_search_url(city: str, category_path: str, query: str, page: int) -> str:
+    city = (city or "rossiya").strip() or "rossiya"
     q = urllib.parse.quote(query) if query else ""
     url = f"{BASE_URL}/{city}{category_path}"
     params = []
@@ -372,12 +373,20 @@ def scrape_page(
             if max_price and price > max_price:
                 continue
 
-            # достаём полное описание (осторожно, дорого — только тут)
+            card_text = ""
+            try:
+                card_text = card.inner_text()
+            except Exception:
+                pass
+            has_delivery = bool(card.query_selector('[data-marker="delivery/icon"], [class*="delivery"]')) or ("доставка" in card_text.lower())
+
             description = ""
             try:
                 title_el2 = card.query_selector('[data-marker="item-specific-params"]')
                 if title_el2:
                     description = title_el2.inner_text().strip()
+                elif card_text:
+                    description = " | ".join(line.strip() for line in card_text.splitlines() if line.strip())[:400]
             except Exception:
                 pass
 
@@ -389,6 +398,7 @@ def scrape_page(
                 "seller": seller,
                 "category": category_name,
                 "description": description,
+                "has_delivery": has_delivery,
             })
         except Exception:
             continue
@@ -449,7 +459,7 @@ class AvitoHunterApp(ctk.CTk):
         # ---- ЗАКРЕПЛЁННЫЕ КНОПКИ СВЕРХУ ----
         btn_bar = ctk.CTkFrame(self.left, fg_color="transparent")
         btn_bar.pack(side="top", fill="x", padx=6, pady=(8, 4))
-        btn_bar.grid_columnconfigure((0, 1, 2), weight=1)
+        btn_bar.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         self.btn_start = ctk.CTkButton(
             btn_bar, text="🚀 Запустить поиск", command=self.on_start,
@@ -467,7 +477,13 @@ class AvitoHunterApp(ctk.CTk):
             btn_bar, text="📊 Сохранить в Excel", command=self.on_save_excel,
             fg_color="#15803d", hover_color="#166534",
         )
-        self.btn_excel.grid(row=0, column=2, padx=(4, 0), sticky="ew")
+        self.btn_excel.grid(row=0, column=2, padx=4, sticky="ew")
+
+        self.btn_help = ctk.CTkButton(
+            btn_bar, text="📖 Справка", command=self.on_open_help,
+            fg_color="#334155", hover_color="#475569", width=90,
+        )
+        self.btn_help.grid(row=0, column=3, padx=(4, 0), sticky="ew")
 
         # ---- ПРОКРУЧИВАЕМАЯ ЗОНА НАСТРОЕК ----
         self.left_scroll = SmoothScrollFrame(self.left)
@@ -877,10 +893,10 @@ class AvitoHunterApp(ctk.CTk):
 
                         # Записываем в results
                         delta_text = f"🔥 -{diff} ₽" if diff else ""
-                        delivery = ""
+                        delivery = "📦 Авито Доставка" if item.get("has_delivery") else "🏠 Самовывоз"
                         com = detect_delivery_commission(item.get("description", ""))
                         if com:
-                            delivery = f"⚠ комиссия {com}"
+                            delivery += f" (⚠ +{com})"
 
                         item.update({
                             "score_name": score_name,
@@ -1038,6 +1054,53 @@ class AvitoHunterApp(ctk.CTk):
         self.status.configure(text="Сообщение продавцу скопировано в буфер обмена.")
 
     # ---------------- Excel ----------------
+    def on_open_help(self) -> None:
+        win = ctk.CTkToplevel(self)
+        win.title("📖 Инструкция и справочник — Avito Hardware Hunter v2.0")
+        win.geometry("760x620")
+        win.after(150, win.grab_set)
+
+        scroll = SmoothScrollFrame(win)
+        scroll.pack(fill="both", expand=True, padx=12, pady=12)
+        box = scroll.inner
+
+        sections = [
+            ("1. Как правильно писать поисковые запросы",
+             "Пишите коротко и по сути — без лишних слов вендоров и длинных названий:\n"
+             "• Правильно: rx 580 8gb, gtx 1060 6gb, ryzen 5 5600, ddr4 16gb, b450 am4\n"
+             "• Неправильно: Видеокарта Sapphire Nitro+ AMD Radeon RX 580 8GB GDDR5 (отсечёт 90% частников)."),
+            ("2. Как читать индекс выгоды (₽ / FPS)",
+             "Программа распознаёт модель видеокарты и делит цену на её индекс производительности (эталон GTX 1060 6GB = 100 баллов):\n"
+             "• До 150 ₽/FPS (зелёный) — отличная рыночная цена / выгодная покупка.\n"
+             "• 150–250 ₽/FPS (жёлтый) — средняя цена по рынку.\n"
+             "• Выше 250 ₽/FPS — завышенная цена или оверпрайс."),
+            ("3. Локальная память цен (SQLite) и ЧС продавцов",
+             "• Все найденные объявления сохраняются в локальный файл hunter_history.db рядом с программой.\n"
+             "• При повторном поиске, если продавец снизил цену, в столбце «Динамика» загорится метка 🔥 -... ₽.\n"
+             "• Кнопка «🚫 В ЧС продавца» навсегда скрывает перекупов и магазины с хламом."),
+            ("4. Чек-лист перед оплатой Авито Доставки",
+             "• Нажмите на объявление в таблице -> внизу нажмите «📋 Скопировать сообщение продавцу».\n"
+             "• Всегда просите скрин GPU-Z + 10 минут стресс-теста FurMark с видимой температурой и датой/временем на экране.\n"
+             "• В пункте выдачи сверяйте серийный номер на наклейке платы с номером на коробке и в GPU-Z."),
+        ]
+        for title, body in sections:
+            card = ctk.CTkFrame(box, corner_radius=10, border_width=1, border_color="#334155")
+            card.pack(fill="x", padx=6, pady=6)
+            ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=14, weight="bold"), anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+            ctk.CTkLabel(card, text=body, justify="left", wraplength=690, anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12, pady=(0, 10))
+
+        links_frame = ctk.CTkFrame(box, corner_radius=10, border_width=1, border_color="#334155")
+        links_frame.pack(fill="x", padx=6, pady=6)
+        ctk.CTkLabel(links_frame, text="5. Полезные справочники для проверки характеристик и совместимости", font=ctk.CTkFont(size=14, weight="bold"), anchor="w").pack(fill="x", padx=12, pady=(10, 6))
+        btn_row = ctk.CTkFrame(links_frame, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+        for label, url in [
+            ("🎮 TechPowerUp GPU Specs", "https://techpowerup.com"),
+            ("🧠 TechPowerUp CPU Specs", "https://techpowerup.com"),
+            ("🖥 Конфигуратор ПК DNS", "https://dns-shop.ru"),
+        ]:
+            ctk.CTkButton(btn_row, text=label, command=lambda u=url: webbrowser.open(u), fg_color="#1f6feb").pack(side="left", padx=(0, 8))
+
     def on_save_excel(self) -> None:
         if not self.results:
             messagebox.showinfo("Пусто", "Нет данных для сохранения.")
