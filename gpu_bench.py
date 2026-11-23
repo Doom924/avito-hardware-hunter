@@ -171,7 +171,8 @@ def _detect_series(text: str) -> Optional[str]:
                       "2080", "2080 super", "2080 ti"):
             if series in ("750", "960", "970", "980", "980 ti",
                           "1050", "1050 ti", "1060", "1070", "1070 ti",
-                          "1080", "1080 ti"):
+                          "1080", "1080 ti",
+                          "1650", "1650 super", "1660", "1660 super", "1660 ti"):
                 return f"gtx {series}"
             return f"rtx {series}"
         return f"rtx {series}"

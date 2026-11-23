@@ -27,6 +27,20 @@ import webbrowser
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+
+# ---------------------------------------------------------------------------
+# Platform-agnostic base directory (works for both .py and PyInstaller .exe)
+# ---------------------------------------------------------------------------
+def _app_dir() -> str:
+    """Return the directory where the executable/script resides.
+
+    When frozen (PyInstaller onefile), sys.executable points to the .exe.
+    Otherwise, __file__ gives the .py location.
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -52,8 +66,9 @@ except ImportError:
 # Константы
 # ---------------------------------------------------------------------------
 APP_TITLE = "Avito PC-Parts Hunter & Scorer v2.0.0"
-SETTINGS_FILE = "settings.json"
-DB_FILE = "hunter_history.db"
+SETTINGS_FILE = os.path.join(_app_dir(), "settings.json")
+DB_FILE = os.path.join(_app_dir(), "hunter_history.db")
+BROWSER_PROFILE_DIR = os.path.join(_app_dir(), "browser_profile")
 
 BASE_URL = "https://www.avito.ru"
 
@@ -136,14 +151,13 @@ class HunterDB:
         self._lock = threading.Lock()
         self._init()
 
-    def _conn(self) -> sqlite3.Connection:
-        c = sqlite3.connect(self.path, check_same_thread=False)
-        c.row_factory = sqlite3.Row
-        return c
+    def close(self) -> None:
+        """Explicit close — no-op since connections are ephemeral."""
 
     def _init(self) -> None:
-        with self._lock, self._conn() as c:
-            c.execute(
+        conn = sqlite3.connect(self.path, check_same_thread=False)
+        try:
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS seen_items (
                     item_id TEXT PRIMARY KEY,
                     first_price INTEGER,
@@ -153,66 +167,97 @@ class HunterDB:
                     seen_at TEXT
                 )"""
             )
-            c.execute(
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS blacklisted_sellers (
                     seller_key TEXT PRIMARY KEY,
                     reason TEXT
                 )"""
             )
+            conn.commit()
+        finally:
+            conn.close()
 
-    def upsert_item(self, item_id: str, price: int, title: str, seller: str) -> Optional[int]:
-        """Возвращает разницу (если цена снизилась), иначе None."""
+    def upsert_item(
+        self, item_id: str, price: int, title: str, seller: str
+    ) -> tuple[Optional[int], bool]:
+        """Return (price_drop_amount, is_new_record).
+
+        ``price_drop_amount`` is a positive int when the price decreased,
+        ``None`` otherwise.  ``is_new_record`` is ``True`` when the item
+        was inserted for the very first time.
+        """
         if not item_id:
-            return None
-        with self._lock, self._conn() as c:
-            row = c.execute(
-                "SELECT last_price FROM seen_items WHERE item_id = ?", (item_id,)
-            ).fetchone()
-            if row is None:
-                c.execute(
-                    "INSERT INTO seen_items(item_id, first_price, last_price, title, seller_name, seen_at) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (item_id, price, price, title, seller, now_str()),
-                )
-                return None
-            last = int(row["last_price"] or 0)
-            diff = last - price
-            if price < last:
-                c.execute(
-                    "UPDATE seen_items SET last_price = ?, seen_at = ? WHERE item_id = ?",
-                    (price, now_str(), item_id),
-                )
-                return diff
-            # просто обновим метку времени
-            c.execute("UPDATE seen_items SET seen_at = ? WHERE item_id = ?", (now_str(), item_id))
-            return None
+            return None, False
+        with self._lock as lk:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT last_price FROM seen_items WHERE item_id = ?", (item_id,)
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO seen_items(item_id, first_price, last_price, title, seller_name, seen_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (item_id, price, price, title, seller, now_str()),
+                    )
+                    conn.commit()
+                    return None, True
+                last = int(row["last_price"] or 0)
+                diff = last - price
+                if price < last:
+                    conn.execute(
+                        "UPDATE seen_items SET last_price = ?, seen_at = ? WHERE item_id = ?",
+                        (price, now_str(), item_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE seen_items SET seen_at = ? WHERE item_id = ?",
+                        (now_str(), item_id),
+                    )
+                conn.commit()
+                return (diff if diff > 0 else None), False
+            finally:
+                conn.close()
 
     def is_blacklisted(self, seller_key: str) -> bool:
         if not seller_key:
             return False
-        with self._lock, self._conn() as c:
-            r = c.execute(
-                "SELECT 1 FROM blacklisted_sellers WHERE seller_key = ?", (seller_key,)
-            ).fetchone()
-            return r is not None
+        with self._lock as lk:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                r = conn.execute(
+                    "SELECT 1 FROM blacklisted_sellers WHERE seller_key = ?", (seller_key,)
+                ).fetchone()
+                return r is not None
+            finally:
+                conn.close()
 
     def blacklist_seller(self, seller_key: str, reason: str = "") -> None:
         if not seller_key:
             return
-        with self._lock, self._conn() as c:
-            c.execute(
-                "INSERT OR REPLACE INTO blacklisted_sellers(seller_key, reason) VALUES (?,?)",
-                (seller_key, reason),
-            )
+        with self._lock as lk:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO blacklisted_sellers(seller_key, reason) VALUES (?,?)",
+                    (seller_key, reason),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
     def get_blacklist(self) -> list[tuple[str, str]]:
-        with self._lock, self._conn() as c:
-            return [(r["seller_key"], r["reason"]) for r in c.execute(
-                "SELECT * FROM blacklisted_sellers"
-            )]
-
-    def close(self) -> None:
-        pass
+        with self._lock as lk:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                return [(r["seller_key"], r["reason"]) for r in conn.execute(
+                    "SELECT * FROM blacklisted_sellers"
+                )]
+            finally:
+                conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +828,7 @@ class AvitoHunterApp(ctk.CTk):
         with sync_playwright() as pw:
             try:
                 ctx = pw.chromium.launch_persistent_context(
-                    user_data_dir="./browser_profile",
+                    user_data_dir=BROWSER_PROFILE_DIR,
                     channel=use_channel,
                     headless=False,
                     viewport={"width": 1366, "height": 800},
@@ -791,7 +836,7 @@ class AvitoHunterApp(ctk.CTk):
                 )
             except Exception:
                 ctx = pw.chromium.launch_persistent_context(
-                    user_data_dir="./browser_profile",
+                    user_data_dir=BROWSER_PROFILE_DIR,
                     headless=False,
                     viewport={"width": 1366, "height": 800},
                     args=["--disable-blink-features=AutomationControlled"],
@@ -866,28 +911,16 @@ class AvitoHunterApp(ctk.CTk):
                         if seller_key and self.db.is_blacklisted(seller_key):
                             continue
 
-                        # upsert истории
+                        # upsert истории — возвращает (price_drop, is_new_record)
                         price = item["price"]
-                        diff = self.db.upsert_item(
+                        diff, is_new = self.db.upsert_item(
                             iid, price, item["title"], seller_key
                         )
 
-                        # Скрытие просмотренных (если не снизилась цена)
-                        if hide_seen and diff is None:
-                            row = None
-                            # upsert вернул None для повтора — попробуем понять, был ли item
-                            # (отдельный запрос — дорого, используем эвристику по new_on_page)
-                            # Для честности проверим last_price через свежий upsert невозможен.
-                            # Поэтому помечаем как скрытый, если запись уже существовала.
-                            # Простейший способ: если diff is None и item уже в results
-                            # по iid — пропустить.
-                            # Более надёжно: пометим «seen» по факту, что upsert не создал
-                            # новую запись. Мы не знаем этого из API, поэтому добавим
-                            # небольшой трюк: первый вызов upsert для нового id вернёт None
-                            # и создаст запись; повторный вызов тоже None. Различим по
-                            # глобальному множеству уже виденных за эту сессию.
-                            if iid in self._item_meta:
-                                continue
+                        # Скрытие просмотренных: пропускаем только ранее виденные
+                        # объявления, цена на которые не снизилась.
+                        if hide_seen and not is_new and diff is None:
+                            continue
 
                         score_name, ppf = calc_value_index(item["title"], price)
 

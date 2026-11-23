@@ -34,7 +34,7 @@ jobs:
 
       - name: Build EXE (PyInstaller)
         run: |
-          pyinstaller --noconfirm --onefile --windowed             --name AvitoHunter             --collect-all customtkinter             --collect-all playwright             --collect-all openpyxl             avito_hunter_gui.py
+          pyinstaller --noconfirm --onefile --windowed             --name AvitoHunter             --collect-all customtkinter             --collect-all playwright             --collect-all openpyxl             --hidden-import gpu_bench             avito_hunter_gui.py
 
       - name: Verify artifact
         run: |
